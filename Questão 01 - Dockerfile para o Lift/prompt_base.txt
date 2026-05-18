@@ -1,0 +1,55 @@
+[ROLE]
+Você é um engenheiro DevOps sênior, especialista em containerização de
+aplicações Python para clusters Kubernetes, com domínio das
+boas práticas do CIS Docker Benchmark: multi-stage builds, hardening,
+imagens mínimas, layer caching e Pod Security Standards (rootless).
+
+[TASK]
+Escreva um Dockerfile para produção para a aplicação Lift,
+uma API Python/Flask que será implantada em Kubernetes. A imagem
+DEVE seguir todas as boas práticas de Docker.
+
+Detalhes da aplicação:
+- Stack: Python 3.12 + Flask
+- Servidor de produção: gunicorn --bind 0.0.0.0:8080 --workers 4 app:app
+- Porta exposta: 8080
+- Dependências (requirements.txt):
+    Flask==3.0.0
+    gunicorn==21.2.0
+    requests==2.31.0
+    python-dotenv==1.0.0
+    psycopg2-binary==2.9.9
+- Variáveis de ambiente em runtime (NÃO podem entrar na imagem):
+    DATABASE_URL, API_KEY
+
+Estrutura do projeto:
+    lift/
+    ├── app.py
+    ├── requirements.txt
+    ├── lib/
+    │   ├── auth.py
+    │   └── storage.py
+    └── tests/
+        └── test_app.py
+
+Requisitos obrigatórios:
+- Multi-stage build (builder + runtime).
+- Imagem base oficial python:3.12-slim com tag fixa (nunca :latest).
+- Usuário não-root no estágio runtime (UID/GID fixos).
+- Otimização de cache: copiar requirements.txt antes do código fonte.
+- NÃO copiar a pasta tests/ para a imagem final.
+- pip com --no-cache-dir; PYTHONDONTWRITEBYTECODE=1; PYTHONUNBUFFERED=1.
+- libpq-dev apenas no builder; libpq5 no runtime (psycopg2-binary).
+- EXPOSE 8080.
+- HEALTHCHECK consultando /health.
+- CMD em exec form (array JSON) para repasse correto de SIGTERM.
+- Nenhum secret embutido no Dockerfile.
+
+[FORMAT]
+Entregue a resposta exatamente nesta ordem:
+1. Um único bloco ```dockerfile``` com o Dockerfile completo,
+   comentado linha a linha explicando a intenção de cada instrução.
+2. Um bloco ```text``` com um .dockerignore sugerido.
+3. Uma seção em markdown com bullets resumindo as boas práticas aplicadas.
+4. Os comandos `docker build` e `docker run` para teste local,
+   passando DATABASE_URL e API_KEY via -e (valores placeholder).

@@ -1,0 +1,36 @@
+[Role]
+Você é um engenheiro SRE sênior com experiência sólida em PostgreSQL em produção, AWS
+(S3, IAM, Secrets Manager) e shell scripting defensivo no Ubuntu. Escreve bash idiomático
+com set -euo pipefail, traps, validação de pré-requisitos e logging estruturado.
+
+[Task]
+Escrever um script bash de backup automatizado para um PostgreSQL em produção:
+- Host: ledger-db.internal.hvt.io | Porta: 5432
+- Banco: ledger_prod | Usuário: backup_user
+- Senha: variável PGPASSWORD (já populada pelo Secrets Manager via IAM role; o script
+  NÃO busca o segredo)
+- SO alvo: Ubuntu 22.04 LTS
+- Diretório local: /var/backups/ledger (80 GB livres; dump compactado ~12 GB)
+- Bucket S3 destino: hvt-ledger-backups | Região: us-east-1
+- Retenção S3: 30 dias (remover objetos mais antigos)
+- Log: /var/log/ledger-backup.log, uma linha por evento, com timestamp ISO-8601
+- Exit code: 0 em sucesso; ≠0 em qualquer falha de etapa (dump, gzip, upload, retenção)
+
+Comportamentos obrigatórios:
+1. set -euo pipefail no topo
+2. Arquivo de saída: ledger_prod_YYYY-MM-DD_HHMMSS.sql.gz
+3. pg_dump em formato plain, pipado direto para gzip (sem .sql intermediário em disco)
+4. Limpar dumps locais com mais de 7 dias após upload bem-sucedido
+5. Função de log central usada por todas as etapas
+6. trap ERR que registra em qual etapa houve falha
+7. Verificar pré-requisitos: binários (pg_dump, aws, gzip), diretório existe, PGPASSWORD definida
+8. Sugerir a linha de crontab ao final (em comentário fora do script)
+
+[Format]
+Entregar APENAS o script bash em um único bloco de código:
+- Shebang #!/usr/bin/env bash
+- Cabeçalho com propósito, owner (SRE - HVT), data e dependências
+- Constantes em UPPER_SNAKE_CASE no topo
+- Funções nomeadas: log, check_prereqs, run_dump, upload_s3, cleanup_local, cleanup_s3
+- Comentários inline curtos só onde a decisão não é óbvia
+- Depois do script, em UMA linha de comentário separada, a entrada de crontab para 03:00

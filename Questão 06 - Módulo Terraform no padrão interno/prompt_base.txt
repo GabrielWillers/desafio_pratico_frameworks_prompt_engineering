@@ -1,0 +1,61 @@
+[CONTEXT]
+Você é engenheiro de plataforma na Hilltop. A área de Segurança & Compliance (Strickland)
+publicou um padrão interno de IaC para todos os módulos Terraform novos, com as
+seguintes regras não-negociáveis:
+
+- Toda variável em variables.tf precisa ter "description" e "type".
+- Todo recurso tem que carregar as tags obrigatórias: Owner, CostCenter, Environment.
+- Nomes de recursos seguem o prefixo "hvt-".
+- Todo bucket S3 precisa de:
+    * Server-Side Encryption habilitado (mínimo SSE-S3 / AES256).
+    * Versioning ativo.
+    * Block Public Access total (4 flags em true).
+    * Logging de acesso configurado para um bucket externo.
+
+O módulo será consumido por todos os times da empresa, então precisa de um exemplo
+de uso pronto para copy-paste.
+
+[ACTION]
+Gere um módulo Terraform reutilizável que provisione um bucket S3 aderente a 100%
+das regras acima. Inclua:
+1. variables.tf — todas as variáveis com description e type.
+2. main.tf — bucket + recursos de configuração (versioning, encryption, PAB, logging).
+3. outputs.tf — pelo menos bucket_id e bucket_arn.
+4. examples/basic/main.tf — chamada do módulo com valores fictícios plausíveis.
+
+Não invente regras adicionais nem omita nenhuma das obrigatórias. Se uma variável
+puder ter default seguro (ex.: logging_prefix), defina-o; caso contrário, deixe
+sem default para forçar input explícito.
+
+[RESULT]
+Entregue cada arquivo em um bloco de código separado, com cabeçalho "# nome-do-arquivo"
+na primeira linha. Sem texto explicativo entre os blocos — apenas o código.
+Ao final, em um único parágrafo curto, liste quais regras do padrão Strickland
+cada bloco endereça (auditoria rápida).
+
+[EXAMPLE]
+Use exatamente o mesmo estilo de naming, tagging e estrutura do módulo de VPC
+já existente na empresa:
+
+variable "environment" {
+  description = "Nome do ambiente (dev, staging, production)"
+  type        = string
+}
+
+locals {
+  common_tags = {
+    Owner       = var.owner
+    CostCenter  = var.cost_center
+    Environment = var.environment
+  }
+}
+
+resource "aws_vpc" "this" {
+  cidr_block = var.cidr_block
+  tags = merge(local.common_tags, {
+    Name = "hvt-vpc-${var.environment}"
+  })
+}
+
+Replique: nome interno do recurso "this", uso de locals.common_tags + merge(),
+naming com prefixo "hvt-" e sufixo de ambiente, descriptions em português.

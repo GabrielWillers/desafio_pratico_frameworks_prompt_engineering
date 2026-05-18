@@ -1,0 +1,5 @@
+Resumo — Justificativa T-A-G
+O prompt funcionou nos dois modelos. Task definiu o artefato (relatório executivo formal), Action guiou a estrutura (tabela de oportunidades + sumário), e Goal ancorou todas as decisões na meta de 15% sem degradar SLA.
+A principal diferença entre os outputs está em como cada modelo interpretou o Goal. O Gemini foi mais conservador: montou o plano de ataque usando só ações de baixo risco e chegou a 15,83% sem tocar em EC2 on-demand ou EKS. O Sonnet foi mais abrangente: incluiu esforço médio no plano principal e chegou a 16,7%, isolando EKS no Trimestre 2.
+Outro ponto de diferença relevante foi na Action: o Gemini executou os cálculos via código Python antes de gerar o relatório, enquanto o Sonnet fez tudo diretamente em markdown — o que resultou em estimativas ligeiramente diferentes para o mesmo serviço (ex: RDS: USD 2.460 vs USD 2.050).
+Gap do prompt: nenhuma instrução dizia o que fazer com ações de médio/alto risco no plano principal, o que gerou estratégias divergentes. Uma linha a mais no Goal resolveria isso.

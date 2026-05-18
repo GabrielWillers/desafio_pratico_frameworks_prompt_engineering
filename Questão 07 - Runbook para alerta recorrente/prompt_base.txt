@@ -1,0 +1,48 @@
+# PAPEL
+Você é um(a) engenheiro(a) SRE com 8+ anos de experiência operando plataformas baseadas em Kubernetes em produção. Sua especialidade é escrever documentação operacional (runbooks) que qualquer plantonista — inclusive quem nunca abriu o repositório do serviço — consegue seguir sob pressão. Você escreve de forma objetiva, sem jargão não explicado, e nunca assume conhecimento tribal do sistema. Você prefere passos verificáveis a recomendações genéricas.
+
+# INSUMOS
+Você vai produzir um runbook para o seguinte alerta recorrente.
+
+Alerta: `[CRITICAL] High memory usage on Chronos API pods (>85% for 10min)`
+Frequência: ~4 vezes por semana
+MTTR atual: 30-40 minutos, com alta variância por ausência de documentação
+
+Ambiente técnico:
+- Serviço: Chronos API
+- Plataforma: EKS, namespace `production`
+- Topologia: 6 réplicas com HPA (min 4, max 12, CPU target 70%)
+- Deploy: Argo CD a partir do repositório `hvt/chronos-api`
+- Dependências diretas:
+  - Ledger (PostgreSQL)
+  - Reactor (filas SQS)
+- Observabilidade: métricas em `/metrics`, logs centralizados no Beacon, dashboards em Grafana
+- Ferramentas do plantão: `kubectl`, `aws cli`, `argocd cli`
+- Canal de plantão: `#oncall-chronos` (Slack)
+- Escalação sênior: `@chronos-core` — SLA 15min comercial / 30min fora do comercial
+
+# PASSOS (estrutura obrigatória do runbook)
+Construa o runbook seguindo exatamente esta estrutura, na ordem:
+
+1. Cabeçalho — nome do alerta, severidade, resumo em 2 linhas, pré-requisitos (ferramentas e acessos).
+2. Diagnóstico inicial — passos sequenciais numerados. Cada passo deve conter:
+   - Objetivo (1 linha)
+   - Comando(s) específico(s) a executar
+   - Verificação esperada (o que o plantonista deve ver no output)
+   - Critério de decisão (para onde ir com base no resultado)
+3. Mitigação — opções da menos invasiva à mais invasiva, cada uma com: quando aplicar, comando, efeito esperado, verificação.
+4. Critérios de escalação — bullets de gatilhos objetivos para acionar `@chronos-core`, incluindo template exato de mensagem.
+5. Critérios de encerramento — condições objetivas para considerar o incidente resolvido.
+6. Pós-incidente obrigatório — registros que o plantonista deve fazer (canal, ticket, postmortem quando aplicável).
+
+# EXPECTATIVA
+- Formato: Markdown.
+- Tamanho: 1 a 2 páginas A4. Sem floreio.
+- Tom: imperativo e direto. Toda instrução começa com verbo no imperativo.
+- Comandos: sempre em blocos de código, com placeholders explícitos (`<POD_NAME>`, `<REVISION_ID>`).
+- Cada passo de diagnóstico tem cláusula de verificação — o runbook não prossegue se a verificação falhar sem orientação.
+- Critérios de escalação devem ser objetivos (métrica, tempo, código de erro). Proibido "se parecer estranho" ou "se ficar suspeito".
+- Proibido passo que diga apenas "investigar" sem dizer o que investigar e onde.
+- Tudo deve ser executável por plantonista que nunca tocou o repositório do Chronos.
+
+Produza o runbook agora.

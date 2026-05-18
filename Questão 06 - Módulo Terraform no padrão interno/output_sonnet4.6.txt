@@ -1,0 +1,201 @@
+# variables.tf
+
+variable "environment" {
+  description = "Nome do ambiente (dev, staging, production)"
+  type        = string
+}
+
+variable "owner" {
+  description = "Time ou pessoa responsável pelo recurso"
+  type        = string
+}
+
+variable "cost_center" {
+  description = "Centro de custo para alocação financeira do recurso"
+  type        = string
+}
+
+variable "bucket_suffix" {
+  description = "Sufixo único para compor o nome do bucket S3 (ex.: dados-brutos, backups)"
+  type        = string
+}
+
+variable "logging_target_bucket" {
+  description = "ID do bucket S3 externo que receberá os logs de acesso"
+  type        = string
+}
+
+variable "logging_target_prefix" {
+  description = "Prefixo de caminho para os objetos de log dentro do bucket de destino"
+  type        = string
+  default     = "s3-access-logs/"
+}
+
+variable "force_destroy" {
+  description = "Permite destruir o bucket mesmo com objetos dentro (usar com cautela)"
+  type        = bool
+  default     = false
+}
+
+variable "additional_tags" {
+  description = "Mapa de tags extras a serem mescladas com as tags obrigatórias"
+  type        = map(string)
+  default     = {}
+}
+
+# main.tf
+
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0.0"
+    }
+  }
+}
+
+locals {
+  common_tags = {
+    Owner       = var.owner
+    CostCenter  = var.cost_center
+    Environment = var.environment
+  }
+
+  bucket_name = "hvt-s3-${var.bucket_suffix}-${var.environment}"
+}
+
+# ── Recurso principal ────────────────────────────────────────────────────────
+
+resource "aws_s3_bucket" "this" {
+  bucket        = local.bucket_name
+  force_destroy = var.force_destroy
+
+  tags = merge(local.common_tags, var.additional_tags, {
+    Name = local.bucket_name
+  })
+}
+
+# ── Versioning ───────────────────────────────────────────────────────────────
+
+resource "aws_s3_bucket_versioning" "this" {
+  bucket = aws_s3_bucket.this.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# ── Server-Side Encryption (SSE-S3 / AES256) ─────────────────────────────────
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
+  bucket = aws_s3_bucket.this.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+
+    bucket_key_enabled = true
+  }
+}
+
+# ── Block Public Access (4 flags) ─────────────────────────────────────────────
+
+resource "aws_s3_bucket_public_access_block" "this" {
+  bucket = aws_s3_bucket.this.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# ── Access Logging ────────────────────────────────────────────────────────────
+
+resource "aws_s3_bucket_logging" "this" {
+  bucket = aws_s3_bucket.this.id
+
+  target_bucket = var.logging_target_bucket
+  target_prefix = var.logging_target_prefix
+}
+
+# outputs.tf
+
+output "bucket_id" {
+  description = "ID (nome) do bucket S3 provisionado"
+  value       = aws_s3_bucket.this.id
+}
+
+output "bucket_arn" {
+  description = "ARN do bucket S3 provisionado"
+  value       = aws_s3_bucket.this.arn
+}
+
+output "bucket_name" {
+  description = "Nome completo do bucket gerado pelo módulo"
+  value       = local.bucket_name
+}
+
+output "bucket_regional_domain_name" {
+  description = "Endpoint regional do bucket para uso em políticas e integrações"
+  value       = aws_s3_bucket.this.bucket_regional_domain_name
+}
+
+# examples/basic/main.tf
+
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+# Bucket de logs pré-existente (referenciado, não gerenciado por este exemplo)
+data "aws_s3_bucket" "logs" {
+  bucket = "hvt-s3-access-logs-central-production"
+}
+
+module "dados_brutos" {
+  source = "../../"
+
+  # Identificação & naming
+  environment   = "production"
+  bucket_suffix = "dados-brutos"
+
+  # Tags obrigatórias Strickland
+  owner       = "engenharia-plataforma"
+  cost_center = "CC-4821"
+
+  # Logging
+  logging_target_bucket = data.aws_s3_bucket.logs.id
+  logging_target_prefix = "s3-access-logs/dados-brutos/"
+
+  # Comportamento
+  force_destroy = false
+
+  # Tags extras opcionais
+  additional_tags = {
+    Project    = "datalake-v2"
+    ManagedBy  = "terraform"
+  }
+}
+
+output "bucket_id" {
+  value = module.dados_brutos.bucket_id
+}
+
+output "bucket_arn" {
+  value = module.dados_brutos.bucket_arn
+}
+
+Auditoria rápida — cobertura das regras Strickland: variables.tf garante que todas as variáveis possuem description e type explícitos, com default seguro apenas onde faz sentido (logging_target_prefix, force_destroy, additional_tags) e sem default onde o input é obrigatório (owner, cost_center, environment, bucket_suffix, logging_target_bucket). main.tf endereça as quatro regras de bucket — SSE-S3/AES256 via aws_s3_bucket_server_side_encryption_configuration, versioning via aws_s3_bucket_versioning com status Enabled, bloqueio total de acesso público via aws_s3_bucket_public_access_block com as quatro flags em true, e logging via aws_s3_bucket_logging apontando para bucket externo — além de aplicar as tags obrigatórias Owner, CostCenter e Environment em local.common_tags com merge() e prefixo hvt- em todos os nomes de recursos. outputs.tf expõe bucket_id e bucket_arn conforme exigido. examples/basic/main.tf fornece o exemplo copy-paste com valores fictícios plausíveis para consumo por qualquer time da empresa.

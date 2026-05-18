@@ -1,0 +1,18 @@
+SELECT
+    TO_CHAR(created_at, 'YYYY-MM') AS mes,
+    category AS categoria,
+    COUNT(*) AS qtd_transacoes,
+    ROUND(SUM(amount_cents)::numeric / 100, 2) AS volume_reais
+FROM
+    transactions
+WHERE
+    status = 'completed'
+    AND category IN ('subscription', 'one_time', 'refund', 'credit_adjustment')
+    AND created_at >= '2025-10-24'
+    AND created_at < '2026-04-25'
+GROUP BY
+    TO_CHAR(created_at, 'YYYY-MM'),
+    category
+ORDER BY
+    mes ASC,
+    categoria ASC;

@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Propósito  : Backup automatizado do PostgreSQL ledger_prod → S3 (hvt-ledger-backups)
+# Owner      : SRE - HVT
+# Data       : 2026-05-17
+# Dependências: pg_dump (postgresql-client), awscli v2, gzip, coreutils
+# Execução   : Assumida via IAM Role; PGPASSWORD deve estar no ambiente.
+# =============================================================================
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Constantes
+# -----------------------------------------------------------------------------
+readonly DB_HOST="ledger-db.internal.hvt.io"
+readonly DB_PORT="5432"
+readonly DB_NAME="ledger_prod"
+readonly DB_USER="backup_user"
+
+readonly BACKUP_DIR="/var/backups/ledger"
+readonly S3_BUCKET="hvt-ledger-backups"
+readonly S3_REGION="us-east-1"
+readonly S3_PREFIX="backups"        # chave lógica dentro do bucket
+
+readonly LOG_FILE="/var/log/ledger-backup.log"
+readonly LOCAL_RETENTION_DAYS=7     # dias para manter dumps locais
+readonly S3_RETENTION_DAYS=30       # dias para manter objetos no S3
+
+readonly TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"          # ISO-8601 para logs
+readonly FILE_STAMP="$(date -u +"%Y-%m-%d_%H%M%S")"            # para nome de arquivo
+readonly DUMP_FILE="${BACKUP_DIR}/ledger_prod_${FILE_STAMP}.sql.gz"
+
+# Variável mutável: preenchida por run_dump, usada pelo trap ERR
+CURRENT_STEP="init"
+
+# -----------------------------------------------------------------------------
+# Função: log
+# Formato: <timestamp> <level> <mensagem>  →  /var/log + stdout
+# -----------------------------------------------------------------------------
+log() {
+    local level="${1:-INFO}"
+    local message="${2:-}"
+    local entry
+    entry="$(date -u +"%Y-%m-%dT%H:%M:%SZ") [${level}] ${message}"
+    echo "${entry}" | tee -a "${LOG_FILE}"
+}
+
+# -----------------------------------------------------------------------------
+# trap ERR: registra em qual etapa ocorreu a falha e o exit code do comando
+# -----------------------------------------------------------------------------
+trap 'log "ERROR" "Falha na etapa=${CURRENT_STEP} | exit_code=${?} | linha=${LINENO}"' ERR
+
+# -----------------------------------------------------------------------------
+# Função: check_prereqs
+# Valida binários, diretório e variável de ambiente antes de qualquer I/O.
+# -----------------------------------------------------------------------------
+check_prereqs() {
+    CURRENT_STEP="check_prereqs"
+    log "INFO" "Verificando pré-requisitos..."
+
+    local missing=0
+
+    for bin in pg_dump gzip aws; do
+        if ! command -v "${bin}" &>/dev/null; then
+            log "ERROR" "Binário ausente: ${bin}"
+            (( missing++ )) || true   # evita saída imediata do set -e no aritmético
+        fi
+    done
+
+    if [[ ! -d "${BACKUP_DIR}" ]]; then
+        log "ERROR" "Diretório de backup não existe: ${BACKUP_DIR}"
+        (( missing++ )) || true
+    fi
+
+    # PGPASSWORD deve estar populada pelo Secrets Manager via IAM role
+    if [[ -z "${PGPASSWORD:-}" ]]; then
+        log "ERROR" "Variável PGPASSWORD não está definida no ambiente"
+        (( missing++ )) || true
+    fi
+
+    if (( missing > 0 )); then
+        log "ERROR" "Abortando: ${missing} pré-requisito(s) ausente(s)"
+        exit 1
+    fi
+
+    log "INFO" "Pré-requisitos OK"
+}
+
+# -----------------------------------------------------------------------------
+# Função: run_dump
+# pg_dump em formato plain, piped direto para gzip — zero arquivo .sql em disco.
+# A opção --lock-wait-timeout evita bloqueio indefinido em produção.
+# -----------------------------------------------------------------------------
+run_dump() {
+    CURRENT_STEP="run_dump"
+    log "INFO" "Iniciando dump → ${DUMP_FILE}"
+
+    PGPASSWORD="${PGPASSWORD}" pg_dump \
+        --host="${DB_HOST}" \
+        --port="${DB_PORT}" \
+        --username="${DB_USER}" \
+        --dbname="${DB_NAME}" \
+        --format=plain \
+        --no-password \
+        --lock-wait-timeout=30s \
+        | gzip --best > "${DUMP_FILE}"
+
+    local size
+    size="$(du -sh "${DUMP_FILE}" | cut -f1)"
+    log "INFO" "Dump concluído | arquivo=${DUMP_FILE} | tamanho=${size}"
+}
+
+# -----------------------------------------------------------------------------
+# Função: upload_s3
+# Envia o dump para s3://<bucket>/<prefix>/<arquivo>.
+# server-side-encryption AES256 por padrão; storage-class STANDARD_IA reduz custo
+# para arquivos acessados raramente.
+# -----------------------------------------------------------------------------
+upload_s3() {
+    CURRENT_STEP="upload_s3"
+    local s3_key="${S3_PREFIX}/$(basename "${DUMP_FILE}")"
+    log "INFO" "Enviando para s3://${S3_BUCKET}/${s3_key}"
+
+    aws s3 cp "${DUMP_FILE}" "s3://${S3_BUCKET}/${s3_key}" \
+        --region "${S3_REGION}" \
+        --sse AES256 \
+        --storage-class STANDARD_IA \
+        --no-progress
+
+    log "INFO" "Upload concluído | s3://${S3_BUCKET}/${s3_key}"
+}
+
+# -----------------------------------------------------------------------------
+# Função: cleanup_local
+# Remove dumps locais mais antigos que LOCAL_RETENTION_DAYS dias.
+# Executado somente após upload bem-sucedido.
+# -----------------------------------------------------------------------------
+cleanup_local() {
+    CURRENT_STEP="cleanup_local"
+    log "INFO" "Removendo dumps locais com mais de ${LOCAL_RETENTION_DAYS} dias..."
+
+    local deleted
+    deleted="$(find "${BACKUP_DIR}" \
+        -maxdepth 1 \
+        -name "ledger_prod_*.sql.gz" \
+        -mtime "+${LOCAL_RETENTION_DAYS}" \
+        -print \
+        -delete \
+        | wc -l)"
+
+    log "INFO" "Limpeza local concluída | arquivos_removidos=${deleted}"
+}
+
+# -----------------------------------------------------------------------------
+# Função: cleanup_s3
+# Lista objetos no prefix e remove os com LastModified > S3_RETENTION_DAYS dias.
+# Usamos query JMESPath para filtrar no cliente; evita paginar manualmente.
+# -----------------------------------------------------------------------------
+cleanup_s3() {
+    CURRENT_STEP="cleanup_s3"
+    log "INFO" "Aplicando retenção S3 de ${S3_RETENTION_DAYS} dias..."
+
+    # Data de corte em epoch para comparação simples
+    local cutoff_epoch
+    cutoff_epoch="$(date -u -d "${S3_RETENTION_DAYS} days ago" +%s)"
+
+    local deleted=0
+
+    # list-objects-v2 devolve até 1000 objetos por chamada; --query filtra no cliente
+    while IFS= read -r key; do
+        [[ -z "${key}" ]] && continue
+
+        # Obtém LastModified do objeto para comparação
+        local obj_date obj_epoch
+        obj_date="$(aws s3api head-object \
+            --bucket "${S3_BUCKET}" \
+            --key "${key}" \
+            --region "${S3_REGION}" \
+            --query 'LastModified' \
+            --output text)"
+
+        obj_epoch="$(date -u -d "${obj_date}" +%s)"
+
+        if (( obj_epoch < cutoff_epoch )); then
+            aws s3 rm "s3://${S3_BUCKET}/${key}" --region "${S3_REGION}" &>/dev/null
+            log "INFO" "Objeto S3 removido | key=${key}"
+            (( deleted++ )) || true
+        fi
+
+    done < <(aws s3api list-objects-v2 \
+        --bucket "${S3_BUCKET}" \
+        --prefix "${S3_PREFIX}/" \
+        --region "${S3_REGION}" \
+        --query 'Contents[].Key' \
+        --output text \
+        | tr '\t' '\n')   # list-objects-v2 separa chaves por tab no modo text
+
+    log "INFO" "Retenção S3 concluída | objetos_removidos=${deleted}"
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+main() {
+    log "INFO" "======== Backup ledger_prod iniciado | ts=${TIMESTAMP} ========"
+
+    check_prereqs
+    run_dump
+    upload_s3
+    cleanup_local
+    cleanup_s3
+
+    log "INFO" "======== Backup ledger_prod finalizado com sucesso ========"
+}
+
+main "$@"
+
+# Crontab sugerido (03:00 UTC, todo dia): 0 3 * * * /usr/local/bin/ledger_backup.sh >> /var/log/ledger-backup-cron.log 2>&1

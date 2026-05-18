@@ -1,0 +1,90 @@
+## Resumo Executivo
+
+**Execute rollback imediato para v2.47.0.** O deploy v2.48.0 introduziu uma refatoração do pool de conexões do Ledger que, combinada com o timeout reduzido de 5 s→2 s, gerou exaustão do pool em nível de cluster (12 pods × 20 conn = 240 conexões = 240/250 do limite do RDS). O scaling emergencial aliviaria sintomas, mas não remove a causa raiz; com a fila acumulando 800 mensagens/min, cada minuto adicional piora o estado do Reactor. Rollback primeiro, investigação depois.
+
+---
+
+## Timeline do Incidente
+
+| Horário (UTC) | Evento |
+|---|---|
+| 23/04 18:42 | Deploy v2.48.0 (Argo CD sync) |
+| 24/04 13:30 | Regime ainda estável: p99=420 ms, err=0,2% |
+| 24/04 13:45–14:00 | Degradação gradual; pool começa a saturar com crescimento de tráfego (1200→1780 req/s) |
+| 24/04 **14:10** | Inflexão crítica: p99 salta para 2400 ms, err=4,5% [métrica 14:10] |
+| 24/04 14:19:48 | Pool esgotado: `max=20, active=20, waiting=147` [log L1] |
+| 24/04 14:19:51 | Circuit breaker OPEN no ledger-client (87%) [log L5] |
+| 24/04 14:20 | p99=8100 ms, err=11,7%, fila com 50 k msgs [métrica 14:20] |
+
+O delay de ~19 h entre o deploy e o incidente é explicado pela curva de tráfego diária: o pool só esgotou quando o volume cruzou o limiar crítico (~1800 req/s às 14:00).
+
+---
+
+## Análise da Causa Raiz
+
+**Hipótese 1 — Exaustão do pool por regressão na nova biblioteca (CONFIRMADA)**
+O changelog #3 ("pool de conexões movido para nova biblioteca interna") alterou o comportamento de gerenciamento de conexões. A aritmética fecha exatamente: 12 pods × `max=20` = **240 conexões**, idêntico às **240/250 conexões ativas no RDS** [log L1, E]. Conexões não estão sendo devolvidas ao pool na velocidade esperada, ou o pool não está respeitando limites de idle timeout. O psycopg 3.2.0 [changelog #4] pode ter alterado semântica de `autocommit`/`keepalive`, mas evidência insuficiente para isolá-lo da troca de biblioteca como causa primária (faltaria comparar o comportamento do pool com psycopg 3.1.18 na mesma biblioteca nova).
+
+**Hipótese 2 — Timeout de 2 s criando cascata de retry (CONFIRMADA como agravante)**
+Com o timeout reduzido de 5 s→2 s [changelog #5], queries lentas por contenção de lock ou pool cheio passaram a expirar mais cedo [log L2], aumentando a fila de espera (`waiting=147`) e agravando o congestionamento em vez de aliviá-lo. O timeout curto pune exatamente o cenário de saturação que o sistema estava enfrentando.
+
+**Hipótese 3 — Novo endpoint `/v2/transactions/batch` amplificando demanda (PROVÁVEL, secundária)**
+O endpoint de batch [changelog #1] possivelmente executa múltiplas queries por requisição, multiplicando o consumo de conexões. Evidência insuficiente para confirmar — faltariam métricas de conexões por endpoint e profiling das queries do batch. É candidato à investigação nas próximas 24 h.
+
+---
+
+## Avaliação Comparativa: Rollback vs Scaling
+
+| Critério | Rollback v2.47.0 | Scaling Emergencial |
+|---|---|---|
+| **Benefício** | Remove a causa raiz (pool e timeout) | Abre espaço temporário no RDS |
+| **Tempo até efeito** | ~5–8 min (rolling update) | 10–20 min (param group RDS pode exigir restart) |
+| **Risco** | Fila do Reactor ainda precisará ser drenada | RDS tem `max_connections` dependente do instance type; ultrapassar pode derrubar todas as conexões |
+| **O que NÃO resolve** | 50 k mensagens acumuladas no Reactor | A causa raiz no código; próximo pico de tráfego repete o incidente |
+| **Reversibilidade** | Total | Parcial (downscale do RDS exige nova janela) |
+
+Scaling emergencial sem rollback é tratar febre com compressas: pode comprar minutos, mas não para a hemorragia.
+
+---
+
+## Decisão Recomendada
+
+**Ação primária: rollback imediato para v2.47.0.**
+**Ação complementar simultânea:** aumentar temporariamente o `max_connections` no pool para 25–30 durante o rolling update, para absorver a fila do Reactor enquanto os pods antigos ainda estão ativos — isso exige apenas uma variável de ambiente, sem restart do RDS.
+
+Confiança: **alto** — a evidência é direta (aritmética do pool fecha, log confirma exaustão, timeline correlaciona com a única mudança de pool relevante no changelog).
+
+*O que invalidaria esta decisão:* descoberta de que o problema ocorria identicamente em v2.47.0 nas últimas semanas (indicaria causa externa ao deploy, como crescimento orgânico de tráfego).
+
+---
+
+## Plano de Execução
+
+1. **[0:00]** No Argo CD: reverter `chronos-api` para `targetRevision: v2.47.0`, disparar sync imediato.
+2. **[0:00–paralelo]** Ajustar variável de ambiente `LEDGER_POOL_MAX=28` nos pods em execução via `kubectl set env` para absorver demanda residual durante o rollout.
+3. **[0:05]** Gate 1: confirmar que novos pods estsobem com logs sem `connection pool exhausted`. Se persistir, o problema não é exclusivo do v2.48.0 — acionar escalação.
+4. **[0:08]** Gate 2: RDS conexões ativas caindo de 240 → abaixo de 200.
+5. **[0:10]** Gate 3: p99 latência abaixo de 600 ms, err\_rate abaixo de 1%.
+6. **[0:15]** Verificar consumer lag do Reactor começando a diminuir.
+7. **Critério de aborto:** se após 10 min do rollout completo p99 ainda > 3000 ms → escalar RDS para próximo tier de instância (evidência insuficiente de causa raiz, ampliar investigação).
+
+---
+
+## Riscos Residuais e Próximos Passos
+
+**Monitorar nos próximos 30 min:** p99 latência, err\_rate, conexões RDS, consumer lag do Reactor (espera-se retorno a < 2 min de lag).
+
+**Investigar nas próximas 24 h:**
+- Comportamento do pool na nova biblioteca: testar com carga sintética e comparar taxa de retorno de conexões vs v2.47.0.
+- Impacto do endpoint `/v2/transactions/batch` no consumo de conexões por req.
+- Rever o timeout de 2 s: 5 s era dimensionado para o SLA do Ledger — a redução precisa de benchmarks antes de ser reimplantada.
+- Auditar psycopg 3.2.0 changelog para mudanças em pool lifecycle.
+
+**Dívida técnica criada por este incidente:**
+- Ausência de limite global de conexões por serviço com alerta antes de 90% do teto do RDS.
+- HPA no máximo sem circuit breaker no nível do ingress — o sistema aceitou 2650 req/s sem throttling.
+- O endpoint de batch não tem rate limit próprio, criando vetor de amplificação descontrolada.
+
+---
+
+**Confiança: alto** | Invalidado se: logs idênticos forem encontrados em versões anteriores ao v2.48.0.

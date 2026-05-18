@@ -1,0 +1,153 @@
+# ── Secret ──────────────────────────────────────────────────────────────────
+# Aplicar com: kubectl apply -f secret.yaml
+# Valores DEVEM ser base64-encoded em produção; substituir pelos reais.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: chronos-api-secrets
+  namespace: production
+  labels:
+    app.kubernetes.io/name: chronos-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: chronos
+    app.kubernetes.io/managed-by: kubectl
+type: Opaque
+data:
+  # ajustar: substituir pelos valores reais em base64 (echo -n 'valor' | base64)
+  DB_PASSWORD: UEBzc3cwcmQyMDIzIQ==   # placeholder – trocar antes do apply
+  JWT_SECRET: aHZ0LWp3dC1wcm9kLXNlY3JldA==  # placeholder – trocar antes do apply
+---
+# ── Deployment ───────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-api          # preservado – mudar quebra o Deployment existente
+  namespace: production      # preservado
+  labels:
+    # Labels recomendadas Kubernetes (critério 7)
+    app.kubernetes.io/name: chronos-api
+    app.kubernetes.io/instance: chronos-api-production
+    app.kubernetes.io/version: "1.4.2"   # ajustar: alinhar com a tag da imagem
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: chronos
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 3   # HA: mínimo 3 (critério 1)
+
+  # Critério 8 – rollout sem downtime: nenhum pod indisponível, sobe 1 extra
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+
+  selector:
+    matchLabels:
+      app: chronos-api   # preservado – alterar selector destrói o Deployment
+
+  template:
+    metadata:
+      labels:
+        app: chronos-api  # preservado para manter compatibilidade com Services
+        app.kubernetes.io/name: chronos-api
+        app.kubernetes.io/instance: chronos-api-production
+        app.kubernetes.io/version: "1.4.2"  # ajustar
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: chronos
+        app.kubernetes.io/managed-by: kubectl
+    spec:
+      # Critério 9 – conta de serviço padrão não montada (princípio do mínimo privilégio)
+      automountServiceAccountToken: false
+
+      # Critério 9 – tempo para shutdown gracioso (ajustar conforme SLA da app)
+      terminationGracePeriodSeconds: 30
+
+      # Critério 6 – securityContext a nível de Pod
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001    # ajustar: UID não-root definido na imagem
+        runAsGroup: 10001   # ajustar: GID correspondente
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Critério 1 – anti-afinidade preferred: pods espalhados por nós distintos
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: chronos-api
+              topologyKey: kubernetes.io/hostname
+
+      # Volumes para paths graváveis (necessário porque readOnlyRootFilesystem: true)
+      volumes:
+      - name: tmp-dir
+        emptyDir: {}
+      # ajustar: adicionar emptyDir extra para cada outro path gravável da app
+
+      containers:
+      - name: api
+        # Critério 2 – tag SemVer imutável; sem :latest
+        image: chronos-api:1.4.2   # ajustar: incluir registry interno (ex.: registry.internal/chronos-api:1.4.2)
+        imagePullPolicy: IfNotPresent
+
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+
+        # Critério 3 – segredos externalizados via secretKeyRef (nomes de env preservados)
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: chronos-api-secrets
+              key: DB_PASSWORD
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: chronos-api-secrets
+              key: JWT_SECRET
+
+        # Critério 4 – garantia de scheduling (requests) e proteção do nó (limits)
+        resources:
+          requests:
+            cpu: "100m"      # ajustar conforme perfil real de carga
+            memory: "128Mi"  # ajustar
+          limits:
+            cpu: "500m"      # ajustar
+            memory: "256Mi"  # ajustar
+
+        # Critério 5 – readiness: pod só entra no Service quando pronto
+        readinessProbe:
+          httpGet:
+            path: /readyz    # ajustar: confirmar endpoint na app
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+
+        # Critério 5 – liveness: pod reiniciado se travar (nunca antes do readiness passar)
+        livenessProbe:
+          httpGet:
+            path: /healthz   # ajustar: confirmar endpoint na app
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 15
+          failureThreshold: 3
+
+        # Critério 6 – securityContext a nível de container
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true   # exige emptyDir nos paths graváveis
+          capabilities:
+            drop:
+            - ALL
+
+        # Monta /tmp gravável; readOnlyRootFilesystem não permite escrita em outro lugar
+        volumeMounts:
+        - name: tmp-dir
+          mountPath: /tmp
+        # ajustar: espelhar aqui cada emptyDir adicional declarado em volumes

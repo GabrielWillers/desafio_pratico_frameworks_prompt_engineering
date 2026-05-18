@@ -1,0 +1,17 @@
+# Análise comparativa 
+
+**Empate funcional.** Os dois manifests passam nos 10 critérios do AFTER e respeitam todas as travas do BRIDGE (nome, namespace, selector e nomes de env preservados, `emptyDir` em `/tmp` por causa do `readOnlyRootFilesystem`).
+
+**Diferenças que importam:**
+
+| Aspecto | Gemini 3 | Sonnet 4.6 |
+|---|---|---|
+| Secret | `stringData` em plain text (mais legível, mas vaza segredo no Git) | `data` em base64 com aviso de "trocar antes do apply" (mais alinhado ao padrão) |
+| Probes | Sem `failureThreshold` explícito | `failureThreshold: 3` nas duas probes |
+| Porta | `containerPort: 8080` solto | `name: http` + `protocol: TCP` (porta nomeada, referenciável) |
+| Comentários | Curtos, descritivos | Cada bloco aponta o critério da checklist ("Critério 5 – ...") |
+| Registry | Só `# ajustar` na tag | `# ajustar` + exemplo (`registry.internal/...`) |
+
+**Veredito.** Sonnet 4.6 entrega um output marginalmente mais robusto em produção: base64 no Secret, `failureThreshold` nas probes, porta nomeada e rastreabilidade explícita aos critérios. Gemini 3 é mais enxuto e legível, mas o `stringData` em claro é o ponto fraco — em revisão de PR esse Secret seria devolvido.
+
+**Sobre o prompt.** O empate no essencial mostra que o B-A-B carregou os requisitos com força suficiente para que dois modelos diferentes convergissem ao mesmo esqueleto. As variações sobraram só nos lugares onde o prompt deixou margem (formato do Secret, granularidade dos probes, nomeação de porta) — o que é o comportamento esperado de um prompt bem calibrado: trava o que precisa travar e deixa o modelo decidir o resto.

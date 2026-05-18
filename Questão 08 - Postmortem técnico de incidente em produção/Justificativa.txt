@@ -1,0 +1,27 @@
+Justificativa — Q8
+
+Framework escolhido: R-I-S-E
+
+Por que RISE e não os outros
+
+Fui de RISE porque esse cenário tem dois problemas ao mesmo tempo: um volume grande de dados estruturados de entrada (quatro artefatos de tipos diferentes — deploy, métricas, logs e estado de fila) e uma saída que precisa seguir uma sequência lógica de raciocínio bem definida. O RISE tem um slot pra cada um desses problemas separados: o INPUT carrega os dados sem misturar com as instruções, e o STEPS guia o modelo pela sequência de análise sem deixar ele escolher por onde começar. Nos outros frameworks essa separação não existe de forma natural, e eu precisaria ou de um prompt muito bagunçado ou de um que perdesse informação no caminho.
+
+Como cada componente aparece no prompt
+
+ROLE — "Staff SRE de uma plataforma fintech... seu público é o CTO que precisa decidir em até 20 minutos entre rollback e scaling emergencial." Não é só persona de estilo: o Role define o critério de sucesso da resposta. Se o Doc Brown conseguir decidir com o output, o Role cumpriu função. A instrução "quando a evidência permitir uma posição, assuma-a" também vem do Role — ela veta o comportamento de modelo que fica em cima do muro ("pode ser X, pode ser Y...").
+
+INPUT — os cinco artefatos rotulados de A a E com a instrução explícita "use EXCLUSIVAMENTE estes dados". Essa instrução é importante porque, sem ela, modelos tendem a complementar com suposições próprias sobre incidentes genéricos de pool de conexão. O INPUT funciona como contrato: o que está aqui é o que existe, o que não está aqui não pode ser inventado.
+
+STEPS — os seis passos numerados na ordem certa: timeline → causa raiz → análise das opções → recomendação → plano de execução → dívida técnica. Sem isso o modelo pode começar pela recomendação antes de montar a timeline, ou misturar a análise de opções com a causa raiz. A ordem importa porque cada seção sustenta a próxima.
+
+EXPECTATION — formato markdown com header por seção, tamanho de tela de call, tom direto, uso de números dos artefatos em toda afirmação factual. Sem essa seção o modelo entrega algo correto no conteúdo mas inútil no contexto: um postmortem de 8 parágrafos corridos não funciona numa call com o CTO em 20 minutos.
+
+Comparação com os outros frameworks
+
+B-A-B foi o segundo candidato mais forte. O incidente tem estrutura narrativa clara: um estado ruim (Before), um estado desejado (After) e a decisão no meio (Bridge). Before seria o snapshot do incidente em 14:20 — pool esgotado, circuit breaker aberto, fila com 50 k mensagens. After seria o sistema estabilizado. Bridge seria a análise rollback vs scaling. O problema é que o BAB não tem um lugar natural pra cinco artefatos estruturados. Eles entrariam todos empilhados no Before, misturados com o diagnóstico, e o prompt ficaria difícil de ler e de seguir. No RISE os dados entram no INPUT e o raciocínio entra no STEPS — são contêineres diferentes pra coisas de natureza diferente. O BAB funcionaria bem se fosse um incidente simples com um único artefato, mas não aqui.
+
+T-A-G é bom quando a tarefa é determinística e o Goal é um artefato único bem definido — a Q4 (query SQL) é o exemplo perfeito disso. Aqui o problema é o Action: ele teria que absorver ao mesmo tempo os cinco artefatos de entrada, as seis etapas de raciocínio e os critérios de formato. Isso torna o bloco Action grande demais e mistura coisas de natureza diferente. No TAG não tem um slot separado pra "aqui estão os dados" — tudo entra no Action junto. O RISE resolve isso com INPUT e STEPS como seções independentes, o que deixa o prompt mais limpo e o output mais previsível.
+
+O que confirmou a escolha
+
+Nos dois outputs (Gemini 3 e Sonnet 4.6) a estrutura do STEPS se refletiu diretamente na estrutura do output — cada seção do postmortem tem um header correspondente a um passo. Isso é o sinal que o framework estava certo: quando o modelo entrega a estrutura que o STEPS pediu sem inventar seções extras ou pular etapas, o INPUT estava claro e os STEPS funcionaram como trilho. A única diferença real entre os dois outputs foi de formato (Gemini usou mais prosa, Sonnet usou mais tabelas), não de substância — e as duas versões chegaram à mesma conclusão: rollback, pela mesma aritmética (12 × 20 = 240, próximo do limite de 250 do RDS, scaling não resolve sem também rever o código do pool).

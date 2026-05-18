@@ -1,0 +1,109 @@
+# variables.tf
+
+variable "owner" {
+description = "Dono ou equipe responsável pelo recurso"
+type        = string
+}
+
+variable "cost_center" {
+description = "Centro de custo para alocação financeira"
+type        = string
+}
+
+variable "environment" {
+description = "Nome do ambiente (dev, staging, production)"
+type        = string
+}
+
+variable "bucket_base_name" {
+description = "Nome base do bucket S3 (será composto com prefixo hvt- e sufixo de ambiente)"
+type        = string
+}
+
+variable "logging_target_bucket" {
+description = "Nome do bucket S3 externo que receberá os logs de acesso"
+type        = string
+}
+
+variable "logging_target_prefix" {
+description = "Prefixo opcional para a organização dos logs de acesso enviados"
+type        = string
+default     = "s3-access-logs/"
+}
+
+# main.tf
+
+locals {
+common_tags = {
+Owner       = var.owner
+CostCenter  = var.cost_center
+Environment = var.environment
+}
+}
+
+resource "aws_s3_bucket" "this" {
+bucket = "hvt-${var.bucket_base_name}-${var.environment}"
+
+tags = merge(local.common_tags, {
+Name = "hvt-${var.bucket_base_name}-${var.environment}"
+})
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
+bucket = aws_s3_bucket.this.id
+
+rule {
+apply_server_side_encryption_by_default {
+sse_algorithm = "AES256"
+}
+}
+}
+
+resource "aws_s3_bucket_versioning" "this" {
+bucket = aws_s3_bucket.this.id
+
+versioning_configuration {
+status = "Enabled"
+}
+}
+
+resource "aws_s3_bucket_public_access_block" "this" {
+bucket = aws_s3_bucket.this.id
+
+block_public_acls       = true
+block_public_policy     = true
+ignore_public_acls      = true
+restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_logging" "this" {
+bucket        = aws_s3_bucket.this.id
+target_bucket = var.logging_target_bucket
+target_prefix = var.logging_target_prefix
+}
+
+# outputs.tf
+
+output "bucket_id" {
+description = "O ID (nome) do bucket S3 provisionado"
+value       = aws_s3_bucket.this.id
+}
+
+output "bucket_arn" {
+description = "O ARN do bucket S3 provisionado"
+value       = aws_s3_bucket.this.arn
+}
+
+# examples/basic/main.tf
+
+module "s3_bucket" {
+source = "../../"
+
+owner                 = "Plataforma"
+cost_center           = "cc-1234-infra"
+environment           = "dev"
+bucket_base_name      = "app-data"
+logging_target_bucket = "hvt-central-logs-bucket-dev"
+}
+
+O arquivo `variables.tf` endereça a regra de obrigatoriedade de `description` e `type` para todas as variáveis; o arquivo `main.tf` implementa as regras de tags mandatórias via `local.common_tags`, o padrão de nomenclatura com o prefixo `hvt-`, criptografia SSE-S3 (AES256), versionamento ativado, as 4 flags de bloqueio de acesso público definidas como `true` e o encaminhamento de logs para um bucket externo; o arquivo `outputs.tf` cumpre a entrega obrigatória dos valores de `bucket_id` e `bucket_arn`; e o arquivo `examples/basic/main.tf` fornece o exemplo prático pronto para cópia com parâmetros fictícios realistas e sem ocultar os inputs obrigatórios exigidos pelo padrão Strickland.

@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: chronos-api-secrets
+  namespace: production
+type: Opaque
+# Armazenamento seguro dos segredos da aplicação
+stringData:
+  DB_PASSWORD: "P@ssw0rd2023!"
+  JWT_SECRET: "hvt-jwt-prod-secret"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-api
+  namespace: production
+  # Labels recomendadas para governança e rastreabilidade
+  labels:
+    app.kubernetes.io/name: chronos-api
+    app.kubernetes.io/instance: chronos-api-prod
+    app.kubernetes.io/version: 1.4.2
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: chronos
+    app.kubernetes.io/managed-by: manual
+spec:
+  # Garantia de Alta Disponibilidade (HA)
+  replicas: 3
+  # Estratégia de Rollout sem indisponibilidade (Zero Downtime)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  # Selector original preservado para evitar quebra de compatibilidade
+  selector:
+    matchLabels:
+      app: chronos-api
+  template:
+    metadata:
+      labels:
+        app: chronos-api
+        app.kubernetes.io/name: chronos-api
+        app.kubernetes.io/instance: chronos-api-prod
+        app.kubernetes.io/version: 1.4.2
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: chronos
+        app.kubernetes.io/managed-by: manual
+    spec:
+      # Desabilitar token padrão caso não utilize a API do Kubernetes
+      automountServiceAccountToken: false
+      # Tempo explícito para graceful shutdown dos pods
+      terminationGracePeriodSeconds: 30
+      # Segurança a nível de Pod (Runtime seguro e não-root)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001 # ajustar
+        runAsGroup: 10001 # ajustar
+        seccompProfile:
+          type: RuntimeDefault
+      # Evitar que pods fiquem no mesmo nó, distribuindo a carga (HA)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - chronos-api
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: api
+        # Imagem imutável utilizando versionamento SemVer
+        image: chronos-api:1.4.2 # ajustar
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+        # Segurança a nível de Container (Privilégios mínimos e FS imutável)
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        # Injeção de segredos externalizados via SecretKeyRef
+        env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: chronos-api-secrets
+              key: DB_PASSWORD
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: chronos-api-secrets
+              key: JWT_SECRET
+        # Definição e teto de recursos (Garantia de scheduling e limite)
+        resources:
+          requests:
+            cpu: "100m" # ajustar
+            memory: "128Mi" # ajustar
+          limits:
+            cpu: "500m" # ajustar
+            memory: "256Mi" # ajustar
+        # Verificação se o container precisa ser reiniciado
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        # Verificação se o container está pronto para receber tráfego do Service
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        # Volume temporário necessário devido ao readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: tmp-volume
+          mountPath: /tmp
+      # Declaração do volume temporário em memória RAM/Disco local do nó
+      volumes:
+      - name: tmp-volume
+        emptyDir: {}

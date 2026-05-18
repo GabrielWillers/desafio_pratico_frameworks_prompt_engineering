@@ -1,0 +1,150 @@
+Aqui está a solução completa e estruturada para a containerização da aplicação Lift, em total conformidade com as diretrizes do CIS Docker Benchmark e padrões de produção para Kubernetes.
+
+1. Dockerfile
+Dockerfile
+# ==============================================================================
+# ESTÁGIO 1: Builder (Compilação e preparação das dependências)
+# ==============================================================================
+# Define a imagem base oficial do Python com tag fixa para garantir determinismo
+FROM python:3.12-slim AS builder
+
+# Evita que o Python escreva arquivos compilados (.pyc) no disco, economizando espaço
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Garante que a saída do console seja enviada diretamente para o stdout/stderr sem buffering
+ENV PYTHONUNBUFFERED=1
+
+# Configura o diretório de trabalho temporário para o processo de build
+WORKDIR /app
+
+# Atualiza os índices de pacotes e instala ferramentas de compilação e dependências de desenvolvimento
+# O libpq-dev é necessário apenas para a compilação do driver do PostgreSQL (psycopg2)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cria e ativa um ambiente virtual para isolar as dependências e facilitar a cópia para o estágio final
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copia apenas o arquivo de especificações de dependências para maximizar o cache de camadas do Docker
+COPY requirements.txt .
+
+# Atualiza o gerenciador de pacotes pip e instala as dependências sem salvar cache local em disco
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# ==============================================================================
+# ESTÁGIO 2: Runtime (Imagem final otimizada para produção)
+# ==============================================================================
+# Utiliza a mesma imagem base oficial para evitar incompatibilidades de bibliotecas de sistema
+FROM python:3.12-slim AS runtime
+
+# Mantém as boas práticas de execução do binário Python no ambiente produtivo
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Adiciona o ambiente virtual copiado diretamente no PATH da imagem de runtime
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Configura o diretório onde a aplicação residirá em produção
+WORKDIR /app
+
+# Instala apenas a biblioteca compartilhada de runtime (libpq5) e o curl para o Healthcheck
+# Remove os metadados do apt imediatamente após a instalação para mitigar vulnerabilidades e reduzir tamanho
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copia do estágio 'builder' apenas o ambiente virtual com as dependências já compiladas
+COPY --from=builder /opt/venv /opt/venv
+
+# Cria um grupo e um usuário de sistema dedicados, com UID/GID fixos acima de 10000 (evita colisões com o host)
+# Desabilita shell de login por segurança contra vetores de ataque interativos
+RUN groupadd -g 10001 appuser && \
+    useradd -u 10001 -g appuser -s /sbin/nologin -c "Application User" appuser
+
+# Copia o código-fonte necessário de forma granular, evitando explicitamente o diretório de testes (tests/)
+COPY app.py .
+COPY lib/ ./lib/
+
+# Ajusta a propriedade dos arquivos para o usuário não-root criado anteriormente
+RUN chown -R appuser:appuser /app
+
+# Altera o contexto de execução do container. A partir deste ponto, nada roda como root (Rootless Pod Security Standard)
+USER 10001
+
+# Documenta a porta na qual a aplicação ouve internamente dentro do container
+EXPOSE 8080
+
+# Valida periodicamente a integridade da API em runtime usando o endpoint nativo /health
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+# Inicializa o Gunicorn utilizando o 'exec form' (vetor JSON). 
+# Isso garante que o Gunicorn assuma o PID 1 e responda corretamente aos sinais de terminação do Kubernetes (SIGTERM)
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "4", "app:app"]
+2. .dockerignore
+Plaintext
+# Controle de Versão
+.git
+.gitignore
+
+# Ambiente de Testes e Qualidade de Código
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.flake8
+.mypy_cache/
+
+# Arquivos Locais de Configuração e Segredos
+.env
+.env.*
+*.secrets
+*.pem
+*.key
+
+# Caches de Execução Python e IDEs
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.idea/
+.vscode/
+
+# Ambientes Virtuais Locais
+venv/
+.venv/
+env/
+3. Resumo das Boas Práticas Aplicadas
+Multi-Stage Build Estruturado: Separação clara entre o ambiente de build (onde compiladores pesados como gcc e pacotes -dev foram instalados) e o ambiente de runtime. A imagem final contém estritamente o necessário para a execução, reduzindo a superfície de ataque e o tamanho da imagem.
+
+Aderência aos Pod Security Standards (Rootless): O container não roda como root. Foi criado o usuário appuser com ID fixo (10001), sem diretório home e sem capacidade de login interativo (/sbin/nologin).
+
+Otimização de Camadas (Layer Caching): A cópia do requirements.txt e a execução do pip install foram feitas antes da entrada do código-fonte. Como as dependências mudam com menos frequência que o código, o Docker reaproveitará o cache desta camada em builds consecutivos.
+
+Minimização de Artefatos: A pasta tests/ foi excluída tanto no escopo do .dockerignore quanto na estratégia de cópia granular (COPY app.py . e COPY lib/ ./lib/), prevenindo que código de teste e possíveis dependências de mock vazem para o ambiente de produção.
+
+Tratamento de Sinais Unix (PID 1): O uso da notação em array JSON (CMD ["gunicorn", ...]) evita o empacotamento do comando por um shell intermediário (como /bin/sh -c). Isso permite que o processo receba diretamente o comando SIGTERM enviado pelo Kubernetes durante um processo de rolling update, realizando um graceful shutdown.
+
+Gestão de Segredos e Configurações Dinâmicas: Nenhuma variável de ambiente sensível (DATABASE_URL, API_KEY) foi exposta via instrução ENV ou embutida no código da imagem. A imagem foi projetada para ser imutável, recebendo esses dados estritamente em tempo de execução via variáveis injetadas.
+
+Garantia de Eficiência do Pip: Uso do parâmetro --no-cache-dir para assegurar que downloads temporários de pacotes wheel não fiquem persistidos no disco do container.
+
+4. Comandos para Teste Local
+Para buildar a imagem localmente etiquetando-a com uma tag de versão:
+
+Bash
+docker build -t lift-api:1.0.0 .
+Para executar o container localmente validando o comportamento de produção e injetando as variáveis de ambiente necessárias em runtime:
+
+Bash
+docker run -d \
+  -p 8080:8080 \
+  --name lift-app-prod \
+  -e DATABASE_URL="postgresql://db_user:secure_password_here@localhost:5432/liftdb" \
+  -e API_KEY="sk_prod_d3v0p5_s3cr3t_token" \
+  lift-api:1.0.0

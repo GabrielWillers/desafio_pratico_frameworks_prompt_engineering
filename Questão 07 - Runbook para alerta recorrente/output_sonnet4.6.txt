@@ -1,0 +1,193 @@
+# Runbook — [CRITICAL] High Memory Usage on Chronos API Pods
+
+**Severidade:** CRITICAL  
+**Resumo:** Uso de memória nos pods da Chronos API ultrapassou 85% por mais de 10 minutos no namespace `production`. Sem ação, o OOMKiller pode terminar pods e causar indisponibilidade parcial ou total do serviço.
+
+**Pré-requisitos:** `kubectl` configurado para o cluster EKS de produção · `aws cli` autenticado · `argocd cli` autenticado · Acesso de leitura ao Grafana e ao Beacon · Membro do canal `#oncall-chronos`.
+
+---
+
+## 1. Diagnóstico Inicial
+
+### Passo 1 — Confirme o alerta e identifique os pods afetados
+
+**Objetivo:** Verificar quais pods estão acima do limiar e há quanto tempo.
+
+```bash
+kubectl top pods -n production -l app=chronos-api --sort-by=memory
+```
+
+**Verificação esperada:** Lista de pods com coluna `MEMORY`. Pods afetados aparecem com valores elevados (ex.: `> 850Mi` se o limit for `1Gi`).
+
+> ⚠️ Se o comando retornar erro de métricas indisponíveis, verifique o endpoint `/metrics` manualmente (Passo 2) e acesse o Grafana para confirmar o alerta antes de prosseguir.
+
+**Critério de decisão:**
+- 1–2 pods acima do limiar → provável vazamento localizado; siga para o Passo 2.
+- 3+ pods acima do limiar → problema sistêmico; execute Passo 2 e acione escalação em paralelo (ver Seção 4).
+
+---
+
+### Passo 2 — Inspecione os logs dos pods com maior consumo
+
+**Objetivo:** Identificar erros, exceções ou padrões anômalos no período do alerta.
+
+```bash
+kubectl logs <POD_NAME> -n production --since=15m | grep -iE "error|exception|oom|heap|memory|timeout"
+```
+
+**Verificação esperada:** Linhas com stack traces, `OutOfMemoryError`, ou erros repetitivos de conexão com `ledger` (PostgreSQL) ou `reactor` (SQS).
+
+**Critério de decisão:**
+- Erros de conexão com `ledger` ou `reactor` → dependência degradada; vá para o Passo 3.
+- Exceções de memória (heap, OOM) → vazamento de memória na aplicação; execute Mitigação M2 imediatamente.
+- Logs normais sem erros → verifique carga e HPA no Passo 4.
+
+---
+
+### Passo 3 — Verifique a saúde das dependências
+
+**Objetivo:** Descartar degradação em Ledger (PostgreSQL) ou Reactor (SQS) como causa-raiz.
+
+```bash
+# Verifique conectividade com o Ledger a partir de um pod saudável
+kubectl exec -n production <POD_NAME> -- curl -sf http://ledger-service/health
+
+# Verifique profundidade da fila SQS do Reactor
+aws sqs get-queue-attributes \
+  --queue-url <SQS_QUEUE_URL> \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+```
+
+**Verificação esperada:**
+- Ledger: resposta `200 OK` com corpo `{"status":"ok"}` (ou equivalente).
+- SQS: `ApproximateNumberOfMessages` dentro do normal operacional (< 5.000 como referência base; confirme no Grafana histórico).
+
+**Critério de decisão:**
+- Ledger ou SQS degradados → o problema é na dependência, não na Chronos API; abra incidente no serviço respectivo e notifique `#oncall-chronos`. Aplique Mitigação M1 para aliviar a Chronos enquanto aguarda.
+- Dependências saudáveis → siga para o Passo 4.
+
+---
+
+### Passo 4 — Avalie carga e estado do HPA
+
+**Objetivo:** Verificar se o HPA está escalando corretamente e se a carga justifica o consumo de memória.
+
+```bash
+kubectl get hpa chronos-api -n production
+kubectl describe hpa chronos-api -n production | grep -E "Conditions|Metrics|replica"
+```
+
+**Verificação esperada:** Campo `REPLICAS` entre 4 e 12. Condição `AbleToScale: True`. Métrica de CPU próxima do target (70%).
+
+**Critério de decisão:**
+- HPA no máximo (12 réplicas) e memória ainda alta → carga acima da capacidade máxima; aplique Mitigação M3 e escale para `@chronos-core`.
+- HPA abaixo do máximo mas não escalando → verifique se há eventos de throttle (`kubectl describe hpa`); aplique Mitigação M2.
+- HPA escalando normalmente → aguarde 5 minutos e reavalie. Se memória não cair, aplique Mitigação M1.
+
+---
+
+## 2. Mitigação
+
+### M1 — Reiniciar pods com maior consumo (rolling restart parcial) ⬅ menos invasivo
+
+**Quando aplicar:** 1–2 pods isolados com consumo anômalo; demais pods saudáveis; dependências OK.
+
+```bash
+kubectl rollout restart deployment/chronos-api -n production
+```
+
+**Efeito esperado:** Pods são substituídos gradualmente (zero-downtime pelo RollingUpdate). Memória retorna ao baseline em 3–5 minutos.
+
+**Verificação:** Execute `kubectl top pods -n production -l app=chronos-api` após 5 minutos. Todos os pods devem estar abaixo de 75% de memória.
+
+---
+
+### M2 — Forçar rollback para a revisão anterior estável
+
+**Quando aplicar:** Consumo de memória iniciou após um deploy recente; logs indicam regressão.
+
+```bash
+# Identifique a revisão anterior
+argocd app history chronos-api
+
+# Execute o rollback para a última revisão estável
+argocd app rollback chronos-api <REVISION_ID>
+```
+
+**Efeito esperado:** ArgoCD faz o deploy da revisão anterior. Pods são substituídos em 2–4 minutos.
+
+**Verificação:** Confirme a revisão ativa com `argocd app get chronos-api` e reavalie memória com `kubectl top pods` após 5 minutos.
+
+---
+
+### M3 — Escalar manualmente além do HPA (patch temporário) ⬅ mais invasivo
+
+**Quando aplicar:** HPA já está no máximo (12 réplicas); alerta persiste; risco de OOM iminente.
+
+```bash
+kubectl patch deployment chronos-api -n production \
+  -p '{"spec":{"replicas":16}}'
+```
+
+**Efeito esperado:** Carga distribuída entre mais pods reduz pressão de memória individualmente em 5–10 minutos.
+
+**Verificação:** `kubectl get pods -n production -l app=chronos-api` deve mostrar 16 pods em `Running`. Reverta o patch assim que o incidente for encerrado — o HPA assumirá o controle após remoção do override.
+
+> ⚠️ Esta ação bypassa o HPA. Documente no `#oncall-chronos` e garanta reversão no pós-incidente.
+
+---
+
+## 3. Critérios de Escalação
+
+Acione `@chronos-core` imediatamente se qualquer condição abaixo for verdadeira:
+
+- Alerta persiste por **mais de 20 minutos** após início da mitigação.
+- **3 ou mais pods** estão simultaneamente acima de 90% de memória.
+- Qualquer pod foi **terminado por OOMKilled** (`kubectl describe pod <POD_NAME> | grep OOMKilled`).
+- O rollback (M2) falhou ou foi rejeitado pelo ArgoCD com código de erro.
+- `kubectl top pods` mostra crescimento contínuo de memória após M1 e M2.
+
+**Template de mensagem para `#oncall-chronos`:**
+
+```
+@chronos-core — Escalação de incidente
+Alerta: [CRITICAL] High Memory Usage — Chronos API
+Início: <HH:MM hora local>
+Pods afetados: <N> de 12 (ex.: chronos-api-7d9f-xxxxx, ...)
+Maior consumo observado: <X>% por <Y> minutos
+Mitigações aplicadas: <M1 / M2 / M3 — resultado>
+Dependências: Ledger <OK/degradado> · Reactor SQS <OK/degradado>
+Link Grafana: <URL do dashboard>
+Link Beacon (logs): <URL da query>
+```
+
+---
+
+## 4. Critérios de Encerramento
+
+Declare o incidente encerrado somente quando **todas** as condições abaixo forem satisfeitas:
+
+- `kubectl top pods -n production -l app=chronos-api` mostra **todos** os pods abaixo de 75% de memória por no mínimo **10 minutos consecutivos**.
+- Nenhum pod em estado `OOMKilled` ou `CrashLoopBackOff` (`kubectl get pods -n production`).
+- O alerta no sistema de monitoramento entrou em estado **RESOLVED** (aguarde a janela de 10 minutos do alerta).
+- Se M3 foi aplicado: réplicas revertidas ao controle do HPA (`kubectl patch deployment chronos-api -n production -p '{"spec":{"replicas":null}}'`).
+
+---
+
+## 5. Pós-Incidente Obrigatório
+
+Execute estas ações antes de encerrar o plantão, independentemente da causa:
+
+**Registro no canal:**
+Poste em `#oncall-chronos` com: hora de início, hora de encerramento, causa identificada, mitigação aplicada, e se houve impacto ao usuário (erros 5xx, latência elevada).
+
+**Ticket:**
+Abra um ticket no sistema de rastreamento com label `chronos-api` e `memory-incident`. Inclua o output de `kubectl top pods` no pico e após a mitigação.
+
+**Postmortem** — obrigatório se qualquer um dos itens abaixo for verdadeiro:
+- Incidente durou mais de 30 minutos.
+- Houve OOMKill de pelo menos um pod.
+- Rollback foi necessário.
+- Escalação para `@chronos-core` foi acionada.
+
+O postmortem deve incluir: timeline, causa-raiz (mesmo que provisória), ação corretiva com responsável e prazo. Registre no repositório `hvt/chronos-api` em `/docs/postmortems/`.

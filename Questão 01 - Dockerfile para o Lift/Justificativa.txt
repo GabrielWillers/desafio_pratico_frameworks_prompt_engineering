@@ -1,0 +1,13 @@
+Justificativa — como Role, Task e Format aparecem no prompt
+Com os dois outputs em mãos (Gemini 3 e Claude Sonnet 4.6), dá para mostrar não só onde cada componente do R-T-F aparece no prompt, mas também como cada um deles puxou comportamentos específicos nas duas respostas. Isso é o que valida o framework: se um componente do prompt não influenciou o output, ele não está cumprindo função.
+Role — "engenheiro DevOps sênior, especialista em containerização Python para Kubernetes, com domínio do CIS Docker Benchmark e PSS rootless"
+Onde aparece no prompt: bloco [ROLE], primeiro de tudo.
+O que esse Role estava tentando ancorar: vocabulário e decisões de um especialista, não de um tutorial introdutório. Em particular, três marcadores: (i) CIS Docker Benchmark, (ii) Pod Security Standards rootless, (iii) layer caching.
+Evidência nos outputs:
+
+Os dois modelos abriram o output se referindo explicitamente ao CIS Docker Benchmark. O Gemini abre com "em total conformidade com as diretrizes do CIS Docker Benchmark"; o Sonnet cita "CIS Docker Benchmark 4.1 e Kubernetes Pod Security Standards exigem rootless" dentro do próprio Dockerfile. Sem o Role, esperaria-se um Dockerfile genérico do tipo "FROM python, COPY, CMD" — em vez disso, ambos justificam decisões citando padrões formais.
+O Gemini foi além do que o prompt pedia e escolheu UID 10001 justificando "acima de 10000 para evitar colisões com o host". Esse tipo de raciocínio — UID range, colisão com host — é comportamento de SRE/DevOps sênior, não de junior. O Role puxou esse nível.
+O Sonnet, no mesmo espírito, adicionou "Em Kubernetes, combine com securityContext.runAsNonRoot: true no Pod spec" — um comentário que só faz sentido vindo de alguém que pensa no ciclo Dockerfile↔Pod spec, exatamente a persona descrita.
+
+Os dez requisitos obrigatórios viraram dez decisões observáveis no Dockerfile. Esse é o sinal de que a Task funcionou como contrato. Não houve "quase" — todo item da lista materializou no código.
+Vale notar uma divergência interessante que o prompt deliberadamente deixou em aberto: a forma de fazer o HEALTHCHECK. O Gemini instalou curl no runtime para usar no probe; o Sonnet usou python -c "import urllib.request..." aproveitando que o Python já está na imagem. Ambos atendem ao requisito, mas o Sonnet entregou uma imagem ligeiramente menor — evidência de que requisitos bem definidos ainda permitem espaço para o modelo otimizar onde a Task não impôs restrição.

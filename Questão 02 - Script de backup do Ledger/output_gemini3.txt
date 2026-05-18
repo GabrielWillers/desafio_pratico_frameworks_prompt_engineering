@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Purpose: Automated production PostgreSQL backup with direct gzip compression, S3 upload, and retention enforcement.
+# Owner:   SRE - HVT
+# Date:    2026-05-17
+# Dependencies: pg_dump, aws-cli, gzip, coreutils
+
+set -euo pipefail
+
+# --- Constants ---
+readonly DB_HOST="ledger-db.internal.hvt.io"
+readonly DB_PORT="5432"
+readonly DB_NAME="ledger_prod"
+readonly DB_USER="backup_user"
+readonly BACKUP_DIR="/var/backups/ledger"
+readonly S3_BUCKET="hvt-ledger-backups"
+readonly AWS_REGION="us-east-1"
+readonly LOG_FILE="/var/log/ledger-backup.log"
+readonly RETENTION_LOCAL_DAYS=7
+readonly RETENTION_S3_DAYS=30
+
+# --- Dynamic Variables ---
+readonly TIMESTAMP=$(date +"%Y-%m-%d_%H%M%S")
+readonly BACKUP_FILE="${DB_NAME}_${TIMESTAMP}.sql.gz"
+readonly BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILE}"
+
+# --- Error Handling ---
+error_trap() {
+    local exit_code=$?
+    local line_num=$1
+    local failed_command="$2"
+    log "ERROR" "Pipeline failed at command '${failed_command}' on line ${line_num} with exit code ${exit_code}"
+    exit "${exit_code}"
+}
+trap 'error_trap ${LINENO} "${BASH_COMMAND}"' ERR
+
+# --- Functions ---
+log() {
+    local level="$1"
+    local message="$2"
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    printf "%s [%s] %s\n" "${ts}" "${level}" "${message}" >> "${LOG_FILE}"
+}
+
+check_prereqs() {
+    log "INFO" "Validating script execution prerequisites..."
+    
+    # Verify mandatory binaries
+    for binary in pg_dump aws gzip; do
+        if ! command -v "${binary}" &>/dev/null; then
+            log "ERROR" "Missing required dependency: ${binary}"
+            return 1
+        fi
+    done
+
+    # Verify context and permissions
+    if [[ -z "${PGPASSWORD:-}" ]]; then
+        log "ERROR" "Environment variable PGPASSWORD is not set"
+        return 1
+    fi
+
+    if [[ ! -d "${BACKUP_DIR}" ]]; then
+        log "ERROR" "Target backup directory does not exist: ${BACKUP_DIR}"
+        return 1
+    fi
+
+    if [[ ! -w "${BACKUP_DIR}" ]]; then
+        log "ERROR" "Backup directory is not writable: ${BACKUP_DIR}"
+        return 1
+    fi
+
+    log "INFO" "Prerequisite validation successful."
+}
+
+run_dump() {
+    log "INFO" "Starting plain text pg_dump streamed into gzip compression..."
+    # Piped directly to gzip to optimize disk I/O and save space
+    pg_dump -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -F p "${DB_NAME}" | gzip > "${BACKUP_PATH}"
+    log "INFO" "Local backup file generated successfully: ${BACKUP_PATH}"
+}
+
+upload_s3() {
+    log "INFO" "Uploading backup package to S3 bucket: s3://${S3_BUCKET}/${BACKUP_FILE}..."
+    aws s3 cp "${BACKUP_PATH}" "s3://${S3_BUCKET}/${BACKUP_FILE}" --region "${AWS_REGION}"
+    log "INFO" "S3 target upload completed successfully."
+}
+
+cleanup_local() {
+    log "INFO" "Enforcing local retention policy (removing files older than ${RETENTION_LOCAL_DAYS} days)..."
+    find "${BACKUP_DIR}" -maxdepth 1 -name "${DB_NAME}_*.sql.gz" -type f -mtime +"${RETENTION_LOCAL_DAYS}" -delete
+    log "INFO" "Local file cleanup complete."
+}
+
+cleanup_s3() {
+    log "INFO" "Enforcing S3 lifecycle policy (removing objects older than ${RETENTION_S3_DAYS} days)..."
+    local cutoff_date
+    cutoff_date=$(date -d "${RETENTION_S3_DAYS} days ago" +"%Y-%m-%dT%H:%M:%SZ")
+
+    local old_objects
+    old_objects=$(aws s3api list-objects-v2 \
+        --bucket "${S3_BUCKET}" \
+        --region "${AWS_REGION}" \
+        --prefix "${DB_NAME}_" \
+        --query "Contents[?LastModified<=\`${cutoff_date}\`].Key" \
+        --output text)
+
+    # Validate if any expired objects were returned
+    if [[ -n "${old_objects}" && "${old_objects}" != "None" ]]; then
+        for obj in ${old_objects}; do
+            log "INFO" "Deleting expired S3 object: s3://${S3_BUCKET}/${obj}"
+            aws s3 rm "s3://${S3_BUCKET}/${obj}" --region "${AWS_REGION}"
+        done
+    else
+        log "INFO" "No expired S3 objects detected."
+    fi
+    log "INFO" "S3 retention processing complete."
+}
+
+# --- Orchestration ---
+check_prereqs
+run_dump
+upload_s3
+cleanup_local
+cleanup_s3
+
+log "INFO" "Database backup lifecycle pipeline executed successfully."

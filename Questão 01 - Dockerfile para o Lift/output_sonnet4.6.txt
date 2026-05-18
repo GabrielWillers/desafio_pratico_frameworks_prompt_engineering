@@ -1,0 +1,241 @@
+dockerfile# =============================================================================
+# ESTÁGIO 1: builder
+# Responsável por instalar dependências e compilar artefatos.
+# Tudo que é necessário apenas para build fica aqui — nunca vai para produção.
+# =============================================================================
+
+# Imagem base com tag fixa (SHA ou versão semântica) — jamais :latest.
+# python:3.12-slim é Debian Bookworm mínimo; menor superfície de ataque.
+FROM python:3.12-slim AS builder
+
+# Variáveis de ambiente que influenciam o comportamento do Python durante o build.
+# PYTHONDONTWRITEBYTECODE=1 → impede criação de arquivos .pyc (bytecode desnecessário na imagem).
+# PYTHONUNBUFFERED=1        → força stdout/stderr sem buffer (logs em tempo real no k8s).
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# libpq-dev é necessária APENAS no builder para compilar psycopg2-binary
+# (headers C do PostgreSQL client). Não vai para o runtime.
+# Limpamos o cache do apt na mesma camada para não inflar o layer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Criamos e ativamos um virtualenv isolado dentro do builder.
+# Isso torna o COPY para o runtime trivial e livre de conflitos com o sistema.
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# ── Otimização de cache de camadas ──────────────────────────────────────────
+# Copiamos SOMENTE requirements.txt antes de qualquer código-fonte.
+# Docker re-executa o pip install apenas quando requirements.txt muda,
+# não a cada alteração em app.py ou lib/ — acelera builds incrementais.
+COPY requirements.txt .
+
+# Instalamos dependências dentro do venv.
+# --no-cache-dir → pip não armazena cache local (reduz tamanho do layer).
+# --upgrade pip  → garante resolver de dependências mais recente e seguro.
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# =============================================================================
+# ESTÁGIO 2: runtime
+# Imagem final, mínima e endurecida — única que é publicada no registry.
+# =============================================================================
+
+# Mesma família de imagem base, mesma versão fixada → previsibilidade total.
+FROM python:3.12-slim AS runtime
+
+# Reutilizamos as mesmas flags de ambiente no runtime.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Apontamos para o venv copiado do builder — sem reinstalar nada.
+ENV PATH="/opt/venv/bin:$PATH"
+
+# libpq5 é a biblioteca de RUNTIME do PostgreSQL client (sem headers de compilação).
+# psycopg2-binary já linka contra ela dinamicamente; sem ela o import falha.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Usuário não-root com UID/GID fixos ──────────────────────────────────────
+# CIS Docker Benchmark 4.1 e Kubernetes Pod Security Standards exigem rootless.
+# UID/GID fixos (1001) garantem consistência entre host, registry e cluster.
+# --no-create-home reduz superfície; --shell /bin/false bloqueia login interativo.
+RUN groupadd --gid 1001 appgroup \
+    && useradd --uid 1001 --gid 1001 --no-create-home --shell /bin/false appuser
+
+# Diretório de trabalho da aplicação dentro do container.
+WORKDIR /app
+
+# Copiamos o venv completo do estágio builder — apenas os artefatos compilados,
+# sem ferramentas de build, headers C, ou cache do pip.
+COPY --from=builder /opt/venv /opt/venv
+
+# Copiamos somente os módulos necessários para execução.
+# tests/ é deliberadamente OMITIDO — código de teste não pertence à produção.
+# lib/ contém módulos internos usados em runtime (auth, storage).
+COPY app.py .
+COPY lib/ ./lib/
+# requirements.txt é copiado somente para auditoria/rastreabilidade (opcional).
+COPY requirements.txt .
+
+# Ajustamos a propriedade de todos os arquivos para o usuário não-root.
+# Feito em uma única instrução RUN para não criar layers extras de permissão.
+RUN chown -R appuser:appgroup /app
+
+# ── Princípio do menor privilégio ───────────────────────────────────────────
+# A partir daqui TODOS os processos rodam como appuser (UID 1001), nunca root.
+# Em Kubernetes, combine com securityContext.runAsNonRoot: true no Pod spec.
+USER appuser
+
+# Documentamos a porta que o gunicorn escuta.
+# EXPOSE é informativo para redes Docker e ferramentas de descoberta de serviço.
+EXPOSE 8080
+
+# ── Health check ────────────────────────────────────────────────────────────
+# Kubernetes usa seus próprios probes (livenessProbe/readinessProbe),
+# mas o HEALTHCHECK habilita `docker run` e `docker compose` a detectar
+# containers degradados sem orquestrador. Consulta /health a cada 30s;
+# 3 falhas consecutivas marcam o container como unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"
+
+# ── Comando de inicialização ─────────────────────────────────────────────────
+# Exec form (array JSON) → gunicorn é PID 1, recebe SIGTERM diretamente.
+# Shell form usaria sh -c, que NÃO repassa sinais — causaria shutdown abrupto
+# em rolling deployments Kubernetes (violação do graceful termination).
+# --workers 4      → processos worker (ajuste conforme CPU do nó).
+# --bind 0.0.0.0   → escuta em todas as interfaces do pod.
+# DATABASE_URL e API_KEY chegam via variáveis de ambiente em runtime
+# (Secret do Kubernetes / -e no docker run) — NUNCA embutidos aqui.
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "4", "app:app"]
+text# =============================================================================
+# .dockerignore — exclui do contexto de build tudo que não é necessário.
+# Reduz tamanho do contexto enviado ao daemon e evita vazar dados sensíveis.
+# =============================================================================
+
+# Controle de versão
+.git/
+.gitignore
+.gitattributes
+
+# Testes — não devem ir para a imagem de produção
+tests/
+pytest.ini
+.pytest_cache/
+coverage.xml
+.coverage
+htmlcov/
+
+# Ambientes virtuais locais
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Arquivos de IDE e editores
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Arquivos de configuração de CI/CD locais
+.github/
+.gitlab-ci.yml
+Jenkinsfile
+
+# Secrets e variáveis de ambiente locais (NUNCA devem entrar na imagem)
+.env
+.env.*
+*.env
+secrets/
+
+# Documentação
+docs/
+*.md
+README*
+CHANGELOG*
+LICENSE
+
+# Docker files (desnecessários dentro da própria imagem)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Artefatos de build e distribuição Python
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Logs locais
+*.log
+logs/
+
+✅ Boas práticas aplicadas
+🏗️ Arquitetura de Build
+
+Multi-stage build (builder + runtime): ferramentas de compilação, headers C (libpq-dev) e cache do pip ficam exclusivamente no estágio builder e são descartados — a imagem final contém apenas artefatos de runtime.
+Virtualenv isolado (/opt/venv): copiado integralmente do builder via COPY --from=builder, eliminando qualquer reinstalação no runtime.
+
+🔒 Segurança (CIS Docker Benchmark + PSS)
+
+Usuário não-root com UID/GID fixos (1001): atende ao CIS Benchmark 4.1 e ao Kubernetes Pod Security Standards restricted. UID fixo garante consistência entre camadas, registry e cluster.
+--no-create-home --shell /bin/false: impede login interativo e home directory desnecessário.
+Zero secrets na imagem: DATABASE_URL e API_KEY chegam exclusivamente via variáveis de ambiente em runtime (Kubernetes Secret ou -e).
+.dockerignore rigoroso: bloqueia .env, secrets/, .git/ e outros arquivos sensíveis do contexto de build.
+
+📦 Imagem mínima e superfície reduzida
+
+python:3.12-slim (Debian mínimo) com tag semântica fixa: sem latest, builds reproduzíveis e auditáveis.
+libpq-dev apenas no builder; libpq5 no runtime: split correto entre dependência de compilação e biblioteca de execução.
+apt-get com --no-install-recommends + limpeza de listas em uma única camada: evita pacotes extras e não infla layers com cache do apt.
+tests/ excluído explicitamente: código de teste não faz parte do artefato de produção.
+
+⚡ Otimização de cache de camadas
+
+COPY requirements.txt antes de qualquer código-fonte: o layer do pip install só é invalidado quando as dependências mudam, não a cada commit de app.py ou lib/.
+pip install --no-cache-dir: sem cache local do pip no filesystem, layer menor.
+PYTHONDONTWRITEBYTECODE=1: sem arquivos .pyc poluindo a imagem.
+
+🔄 Operabilidade em Kubernetes
+
+CMD em exec form (array JSON): gunicorn é PID 1 e recebe SIGTERM diretamente, habilitando graceful shutdown em rolling deployments — incompatível com shell form.
+PYTHONUNBUFFERED=1: logs chegam ao stdout/stderr sem buffer, visíveis imediatamente via kubectl logs.
+HEALTHCHECK com start-period, interval, timeout e retries configurados: compatível com docker run e docker compose; em Kubernetes, combine com livenessProbe e readinessProbe no Pod spec.
+EXPOSE 8080: porta documentada, facilita descoberta por ferramentas de orquestração e service mesh.
+
+
+🛠️ Comandos para teste local
+Build da imagem:
+bashdocker build \
+  --tag lift-api:1.0.0 \
+  --label "org.opencontainers.image.version=1.0.0" \
+  --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  .
+Verificar que nenhum processo roda como root:
+bashdocker run --rm lift-api:1.0.0 whoami
+# Saída esperada: appuser
+Executar a aplicação com secrets via -e (valores placeholder):
+bashdocker run \
+  --name lift-api \
+  --rm \
+  --publish 8080:8080 \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  -e DATABASE_URL="postgresql://user:password@localhost:5432/liftdb" \
+  -e API_KEY="placeholder-api-key-change-me" \
+  lift-api:1.0.0
+Verificar o health check manualmente:
+bashcurl -sf http://localhost:8080/health && echo "✅ Healthy" || echo "❌ Unhealthy"
+Inspecionar o status do health check do container:
+bashdocker inspect --format='{{.State.Health.Status}}' lift-api
+
+Nota de segurança: as flags --read-only, --cap-drop ALL e --security-opt no-new-privileges:true no docker run espelham o equivalente Kubernetes (readOnlyRootFilesystem: true, capabilities.drop: ["ALL"], allowPrivilegeEscalation: false) e devem ser replicadas no securityContext do Pod spec em produção.

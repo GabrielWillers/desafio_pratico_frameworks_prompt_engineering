@@ -1,0 +1,135 @@
+# Relatório Executivo — Oportunidades de Redução de Custo AWS
+**Destinatário:** Goldie — Diretoria  
+**Data de referência:** Maio 2026  
+**Elaborado por:** Especialista FinOps Sênior  
+**Classificação:** Interno / Confidencial
+
+---
+
+## 1. Visão Geral Financeira
+
+| Indicador | Valor |
+|---|---|
+| **Custo mensal total da conta** | **USD 41.800** |
+| **Custo anual projetado** | **USD 501.600** |
+| **Meta de redução (15%)** | **USD 6.270/mês** |
+| **Meta anual equivalente** | **USD 75.240** |
+| **Potencial total mapeado** | **USD 9.940/mês (23,8%)** |
+| **Atingível sem ações de alto risco** | **USD 7.730/mês (18,5%)** |
+
+> A meta de **15% (USD 6.270/mês)** é alcançável apenas com iniciativas de esforço Baixo e Médio — sem comprometer redundância, Multi-AZ ou SLA de produção.
+
+---
+
+## 2. Premissas Adotadas para Dados Faltantes
+
+As colunas `uso_medio_pct` estavam ausentes em quatro serviços. As premissas abaixo foram aplicadas de forma conservadora:
+
+| Serviço | Premissa adotada | Justificativa |
+|---|---|---|
+| **S3 Standard** | 60% dos dados com acesso infrequente (< 1×/mês) | Padrão típico de buckets com mix de dados ativos e históricos em ambientes de produção |
+| **CloudWatch Logs** | 100% do custo associado à retenção de 90 dias | Declarado na observação; ausência de uso indica que todo custo é de armazenamento |
+| **CloudWatch Metrics** | 100% customizadas ou acima do nível gratuito | Valor elevado para métricas padrão; sugere métricas custom não revisadas |
+| **Data Transfer Out** | 70% referente a tráfego entre regiões evitável | Observação declara tráfego entre regiões como causa; parte é essencial |
+| **NAT Gateway** | 50% do tráfego direcionável via VPC Endpoints | Assume-se mix de tráfego para serviços AWS (S3, DynamoDB) e destinos externos |
+
+---
+
+## 3. Tabela de Oportunidades — Ordenada por Economia Estimada
+
+| # | Serviço | Ação Recomendada | Economia Est. (USD/mês) | % da Conta | Esforço | Riscos e Pré-requisitos |
+|---|---|---|---|---|---|---|
+| 1 | **EC2 On-Demand** | Migrar baseline de workloads variáveis para **Compute Savings Plans de 1 ano** (commit ~60% do baseline); manter on-demand apenas para picos. Utilização atual de 45% indica excesso de provisionamento — realizar right-sizing antes do commit. | **USD 2.460** | 5,9% | Médio | Requer análise de baseline de 14–30 dias; risco de subcommit se carga crescer; usar AWS Cost Explorer Savings Plans recommendations. |
+| 2 | **RDS PostgreSQL** | Contratar **Reserved Instances RDS de 1 ano (no upfront ou partial upfront)** para as instâncias Multi-AZ. Desconto de 36–40% sobre on-demand sem alterar arquitetura. Multi-AZ mantido integralmente. | **USD 2.050** | 4,9% | Baixo | Confirmar que instâncias estão em on-demand antes de comprar; verificar família e região; RI não é reembolsável — alinhar com roadmap de banco. |
+| 3 | **EKS** | Implementar **Karpenter** para provisionamento dinâmico de nodes; mover workloads de dev/staging para **Spot Instances** (economia de 60–80% nesses ambientes); consolidar 3 clusters para 2 se workloads permitirem. Utilização atual de 58% indica super-provisionamento de nodes. | **USD 1.675** | 4,0% | Alto | Requer testes de estabilidade com Spot; workloads stateful não devem usar Spot; consolidação de clusters exige planejamento de rede e RBAC. |
+| 4 | **CloudWatch Logs** | Reduzir retenção de **90 para 30 dias** nos log groups de aplicação; exportar logs de auditoria/compliance para **S3 Glacier Instant** via automação Lambda. Economia de 55–65% no custo de ingestão e armazenamento. | **USD 1.540** | 3,7% | Baixo | Verificar requisitos de auditoria e conformidade antes de reduzir retenção; alguns log groups regulatórios podem exigir 1 ano. Testar exportação antes de cortar retenção. |
+| 5 | **S3 Standard** | Habilitar **S3 Intelligent-Tiering** nos 5 buckets; configurar **lifecycle policies** para mover objetos com mais de 90 dias para S3 Standard-IA e 180 dias para Glacier Instant. Premissa: 60% dos dados com acesso infrequente. | **USD 930** | 2,2% | Baixo | Intelligent-Tiering tem custo de monitoramento por objeto (USD 0,0025/1.000 obj); não indicado para objetos < 128 KB. Validar tamanho médio dos objetos antes. |
+| 6 | **ElastiCache Redis** | Realizar **right-sizing** do cluster de produção (40% de utilização indica over-provisioning); avaliar migração de instâncias grandes para tipo r7g.medium/large; habilitar **Reserved Nodes de 1 ano**. | **USD 525** | 1,3% | Médio | Testar impacto de latência após redução de tier em janela de manutenção; não eliminar réplica de leitura de produção. |
+| 7 | **Data Transfer Out** | Implementar **VPC Endpoints** para S3, DynamoDB, ECR e outros serviços regionais, eliminando tráfego via NAT Gateway; revisar se chamadas cross-region podem ser substituídas por réplicas ou CDN (CloudFront). | **USD 475** | 1,1% | Médio | VPC Endpoints têm custo fixo por hora; calcular break-even antes; mudança de roteamento pode exigir ajuste em security groups. |
+| 8 | **NAT Gateway** | Redirecionar tráfego de serviços AWS (S3, ECR, Secrets Manager) para **VPC Gateway/Interface Endpoints**; consolidar de 3 para 2 NAT Gateways se a topologia de AZ permitir. | **USD 300** | 0,7% | Médio | Consolidação de NAT Gateway reduz redundância de rede; manter ao menos 1 por AZ onde há workloads críticos. Mapear todo tráfego antes de alterar. |
+| 9 | **EC2 Reservada** | Na renovação do contrato atual (1 ano), migrar de **Reserved Instances para Compute Savings Plans** — maior flexibilidade de família e região com desconto equivalente. Avaliar upgrade para 3 anos se workload for estável. | **USD 280** | 0,7% | Baixo | Ação válida apenas no vencimento do RI atual; não há economia imediata. Savings Plans não são transferíveis entre contas. |
+| 10 | **EBS gp3** | Auditar volumes não anexados (detached); remover snapshots órfãos com mais de 90 dias; verificar volumes superdimensionados via CloudWatch `VolumeIdleTime`. | **USD 200** | 0,5% | Baixo | Risco de excluir snapshot necessário para recovery; criar inventário antes de deletar. |
+| 11 | **CloudWatch Metrics** | Auditar métricas customizadas ativas; remover métricas de dashboards abandonados; substituir métricas custom por **Embedded Metrics Format (EMF)** onde possível (custo de logs < métricas). | **USD 180** | 0,4% | Baixo | Remoção de métrica pode quebrar alarme de CloudWatch; mapear todos os alarmes vinculados antes. |
+| 12 | **Lambda** | Otimizar configuração de **memória por função** com AWS Lambda Power Tuning; revisar Provisioned Concurrency — 30% de utilização sugere concurrency desnecessária. 12M invocações/mês com baixo uso indica funções idle com concurrency provisionada. | **USD 135** | 0,3% | Baixo | Redução de memória pode aumentar duração de execução (custo = GB×s); sempre validar com Power Tuning antes de aplicar em produção. |
+
+**Total de oportunidades mapeadas: USD 9.750/mês — 23,3% da conta**
+
+---
+
+## 4. Justificativas de Faixas de Economia
+
+| Serviço | Base de referência | Faixa aplicada | Valor conservador adotado |
+|---|---|---|---|
+| EC2 On-Demand → Savings Plans | Benchmark AWS: 20–40% sobre on-demand | 30% sobre USD 8.200 | USD 2.460 |
+| RDS → Reserved Instance 1 ano | AWS pricing: 36–40% vs on-demand Multi-AZ | 25% (conservador, não se sabe % on-demand) | USD 2.050 |
+| EKS → Karpenter + Spot | Spot: 60–80% de desconto; right-sizing: 15–20% | 25% combinado sobre USD 6.700 | USD 1.675 |
+| CloudWatch Logs → retenção 30d | Retenção proporcional ao tempo; 90d→30d = -67% | 55% considerando exportação parcial | USD 1.540 |
+| S3 → Intelligent-Tiering | AWS: 40–68% nos dados acessados raramente | 30% do total (60% dos dados × 50% economia) | USD 930 |
+| ElastiCache → right-size + RI | RI: 30–36%; right-sizing: 20–30% | 25% combinado | USD 525 |
+| Data Transfer → VPC Endpoints | Elimina custo NAT Gateway e inter-AZ para serviços AWS | 25% do custo total de transfer | USD 475 |
+
+---
+
+## 5. Caminho para 15% Sem Ações de Alto Risco
+
+As iniciativas abaixo, combinadas, atingem **USD 7.730/mês (18,5%)** — acima da meta de USD 6.270 — utilizando apenas esforço Baixo e Médio:
+
+```
+Iniciativa                              Esforço    Economia/mês   Acumulado   % Conta
+─────────────────────────────────────────────────────────────────────────────────────
+RDS Reserved Instances                  Baixo      USD 2.050      USD 2.050   4,9%
+EC2 On-Demand → Savings Plans           Médio      USD 2.460      USD 4.510   10,8%  ← meta em vista
+CloudWatch Logs → 30 dias + S3          Baixo      USD 1.540      USD 6.050   14,5%
+S3 Intelligent-Tiering + lifecycle      Baixo      USD   930      USD 6.980   16,7%  ← META SUPERADA ✓
+─────────────────────────────────────────────────────────────────────────────────────
+Subtotal das 4 principais                          USD 6.980              16,7%
+
+Reforço (se necessário):
+ElastiCache right-sizing + RI           Médio      USD   525      USD 7.505   17,9%
+Data Transfer → VPC Endpoints           Médio      USD   475      USD 7.980   19,1%
+─────────────────────────────────────────────────────────────────────────────────────
+TOTAL SEM ALTO RISCO                               USD 7.980              19,1%
+```
+
+> **A meta de 15% é atingida com apenas 4 iniciativas de esforço Baixo/Médio, sem depender de consolidação de clusters EKS (Alto esforço).**
+
+---
+
+## 6. Roadmap de Implementação Sugerido
+
+### Trimestre 1 — Impacto Imediato (Esforço Baixo)
+Prazo estimado: 30–45 dias | Economia total: **USD 4.720/mês**
+
+- **Semana 1–2:** Contratar RDS Reserved Instances (aprovação financeira necessária; ação de 1h na console após aprovação)
+- **Semana 2–3:** Revisar e reduzir retenção de CloudWatch Logs + configurar exportação para S3
+- **Semana 3–4:** Habilitar S3 Intelligent-Tiering e criar lifecycle policies
+- **Semana 4–5:** Auditar EBS, snapshots órfãos e métricas CloudWatch custom
+
+### Trimestre 1 — Médio Prazo (Esforço Médio)
+Prazo estimado: 45–75 dias | Economia adicional: **USD 3.260/mês**
+
+- Análise de baseline EC2 on-demand (14 dias) → commit Compute Savings Plans
+- Right-sizing ElastiCache + Reserved Nodes
+- Implementação de VPC Endpoints + consolidação NAT Gateway
+
+### Trimestre 2 — Projetos Estruturais (Esforço Alto)
+Prazo estimado: 60–90 dias | Economia adicional: **USD 1.675/mês**
+
+- Karpenter no EKS + habilitação de Spot para ambientes não-produtivos
+- Avaliação de consolidação de clusters
+
+---
+
+## 7. Resumo Executivo para Goldie
+
+> **Custo atual:** A conta AWS custa **USD 41.800/mês (USD 501.600/ano)**. A **meta de 15% equivale a USD 6.270/mês de economia**.
+>
+> **Top 3 alavancas:** (1) Contratar **Reserved Instances para o RDS** economiza USD 2.050/mês com baixíssimo risco e esforço de horas; (2) migrar o **EC2 on-demand para Compute Savings Plans** (após right-sizing) economiza USD 2.460/mês; (3) reduzir a **retenção do CloudWatch Logs de 90 para 30 dias** com exportação para S3 economiza USD 1.540/mês.
+>
+> **Meta trimestral:** As quatro iniciativas de Baixo e Médio esforço combinadas entregam **USD 6.980/mês (16,7%)** — superando os 15% sem tocar na arquitetura de alta disponibilidade ou no Multi-AZ do RDS.
+>
+> **Principal risco para SLA:** A consolidação dos clusters EKS (Alto esforço, Trimestre 2) é a única ação com risco real de degradação — deve ser precedida de testes exaustivos em staging e não integra o comprometimento do T1. As demais iniciativas são reversíveis ou sem impacto operacional direto.
+
+---
+
+*Relatório gerado com base nos dados de custo fornecidos. Valores de economia são estimativas conservadoras baseadas em benchmarks AWS públicos e práticas de mercado FinOps. Recomenda-se validação com AWS Cost Explorer antes da contratação de Reserved Instances e Savings Plans.*

@@ -1,0 +1,69 @@
+## Resumo Executivo
+
+Recomendo o rollback imediato do deploy v2.48.0 para a versão v2.47.0. A plataforma enfrenta uma exaustão completa de conexões provocada pela introdução do novo endpoint de lote em paralelo com a redução agressiva de timeouts, colidindo com o teto físico do banco de dados. O scaling emergencial apresenta risco crítico de colapso do RDS por sobrecarga de conexões e não mitigará o erro lógico do timeout de 2 segundos.
+
+## Timeline do Incidente
+
+* **23/04 18:42 UTC**: Concluído o deploy da versão v2.48.0 via Argo CD [evento A]. A API opera em regime estável durante a madrugada devido à baixa carga volumétrica.
+* **24/04 13:30 - 13:45 UTC**: Início da curva de tráfego ascendente comercial. A latência p99 permanece saudável (até 510ms) e a taxa de erros está controlada abaixo de 0.3% [métrica 13:30, 13:45].
+* **24/04 14:00 UTC**: **Início da degradação**. Com o aumento da carga para 1780 req/s, a latência p99 sobre para 780ms e os erros dão o primeiro sinal de subida para 0.8% [métrica 14:00].
+* **24/04 14:10 UTC**: **Ponto de inflexão e quebra de regime**. A latência p99 dispara para 2400ms, rompendo o novo limite de timeout de 2s estabelecido no código [changelog #4]. A taxa de erro salta para 4.5% [métrica 14:10].
+* **24/04 14:15 - 14:20 UTC**: **Saturação catastrófica**. A latência p99 atinge 8100ms e os erros chegam a 11.7% [métrica 14:20]. O pool de conexões esgota totalmente [log L1] e o represamento na fila do Reactor acumula um consumer lag crítico de 18 minutos [Reactor D].
+
+## Análise da Causa Raiz
+
+A instabilidade instalada é sistêmica. Ela foi disparada pela concorrência do novo processamento em lote sob alta carga e amplificada pelo comportamento restritivo da nova configuração de timeout.
+
+**Aritmética do Pool de Conexões:**
+O cluster atingiu a capacidade máxima de escalabilidade horizontal permitida, operando com 12/12 pods ativos [Cluster E]. Conforme os logs da aplicação, cada instância gerencia um pool local limitado a `max=20` conexões [log L1].
+
+
+$$12 \text{ pods} \times 20 \text{ conexões/pod} = 240 \text{ conexões ativas simultâneas}$$
+
+
+Esta equação fecha perfeitamente com a infraestrutura: o cluster está retendo exatamente 240 conexões abertas no RDS [Cluster E]. Como o limite rígido do banco de dados é de 250 conexões, restam apenas 10 conexões livres na instância do banco para qualquer outra atividade do ecossistema.
+
+**Hipóteses Ranqueadas:**
+
+1. **Contenção por Execução de Lotes (Alta Probabilidade):** O novo endpoint `POST /v2/transactions/batch` [changelog #1] retém as conexões do pool por um tempo substancialmente maior para processar múltiplos registros por requisição. Sob carga de 2650 req/s [métrica 14:20], o pool de 20 conexões saturou, gerando uma fila severa de 147 requisições travadas aguardando conexão dentro de cada pod [log L1].
+2. **Efeito Cascata por Redução de Timeout (Alta Probabilidade):** A redução do timeout do Ledger de 5s para 2s [changelog #4] foi prematura. Quando a latência natural do banco subiu com a carga, as transações de lote estouraram o limite de 2000ms [log L2]. Isso causou abortos abruptos em cascata (`context deadline exceeded` [log L3] e `connection reset by peer` [log L4]), abrindo o disjuntor (circuit-breaker) da aplicação em 87% [log L5] e interrompendo o envio de mensagens para o Reactor [log L6].
+3. **Regressão de Performance da Nova Biblioteca (Média Probabilidade):** A mudança do mecanismo do pool para a nova biblioteca interna [changelog #2] ou o upgrade do driver psycopg para a v3.2.0 [changelog #3] pode ter introduzido vazamento de conexões ou overhead de alocação sob estresse. Há evidência insuficiente para isolar este fator sem uma análise profunda do código da biblioteca, mas o sintoma macro é de esgotamento total de recursos.
+
+## Avaliação Comparativa: Rollback vs Scaling
+
+* **Opção A: Rollback v2.48.0 -> v2.47.0**
+* *Benefício esperado:* Elimina o endpoint de lote (agressor principal), restaura o timeout original seguro de 5s e retorna à biblioteca estável de gerenciamento de conexões.
+* *Risco:* Pequena flutuação no tempo de resposta durante a substituição dos pods via Argo CD.
+* *Tempo até o efeito:* Rápido. Estabilização estimada em ~3 minutos após o trigger de sincronização do Kubernetes.
+* *O que NÃO resolve:* Não drena instantaneamente as 50.127 mensagens represadas na fila `chronos-transactions` [Reactor D], que precisarão ser digeridas de forma cadenciada pela versão anterior.
+
+
+* **Opção B: Scaling Emergencial (Aumento de Limits)**
+* *Benefício esperado:* Permitiria acomodar as 147 requisições que estão paradas esperando vaga no pool interno [log L1].
+* *Risco:* **Inviabilidade técnica imediata**. Se aumentarmos o pool dos pods para `max=30`, o cluster exigiria $12 \times 30 = 360$ conexões. Como o RDS está limitado a 250 [Cluster E], o banco de dados rejeitaria as conexões excedentes, derrubando o serviço por completo. Elevar o limite de conexões do RDS em produção sob estresse severo exige alteração de parâmetros que pode demandar reboot ou degradar a CPU/IOPS da instância.
+* *Tempo até o efeito:* Lento (10 a 15 minutos entre modificação de infraestrutura de banco e re-deploy de configurações da API).
+* *O que NÃO resolve:* Não resolve o problema lógico de timeout [changelog #4]. As queries do endpoint de lote continuariam estourando o limite de 2000ms [log L2], mantendo a taxa de erro alta e o circuit breaker aberto [log L5].
+
+
+
+## Decisão Recomendada
+
+A decisão tática mandatória é o **Rollback imediato para a v2.47.0**. O scaling emergencial falharia imediatamente devido ao gargalo físico de conexões do RDS (240/250 ocupadas) [Cluster E]. O rollback mitigará simultaneamente todas as frentes problemáticas: remove a rota de lote abusiva, devolve a margem do timeout para 5s e reativa o driver estável.
+
+## Plano de Execução
+
+1. **Trigger de Rollback:** Acessar o Argo CD e realizar o rollback manual da aplicação `chronos-api` para o commit da tag v2.47.0.
+2. **Validação do Rollout (Gate 1):** Acompanhar via terminal a substituição dos recursos (`kubectl rollout status deployment/chronos-api`). Assegurar que os 12 pods alcancem o estado saudável na versão anterior.
+3. **Estabilização do Banco (Gate 2):** Monitorar o recuo imediato das conexões ativas no RDS para níveis abaixo de 200 e a queda drástica do indicador `p99_latency_ms` para parâmetros normais (<500ms).
+4. **Plano de Aborto/Contingência:** Se após a virada completa para a v2.47.0 a taxa de erros persistir acima de 10% por mais de 3 minutos devido à sobrecarga das mensagens acumuladas, pausar temporariamente os consumers da fila `chronos-transactions` para cessar a carga no RDS e permitir a recuperação do banco.
+
+## Riscos Residuais e Próximos Passos
+
+* **Monitoramento Próximos 30 min:** Acompanhar a vazão das 50.127 mensagens represadas na fila do Reactor [Reactor D]. Com a latência normalizada na v2.47.0, o consumo deve acelerar, mas deve-se monitorar a CPU do RDS para evitar que esse dreno sature o banco por completo.
+* **Investigação Próximas 24h:** Isolar o endpoint `POST /v2/transactions/batch` [changelog #1] em ambiente de homologação. Realizar testes de carga agressivos para mapear o perfil de consumo e profiling de concorrência da nova biblioteca interna [changelog #2].
+* **Dívida Técnica Criada:** O incidente escancarou a falta de um isolamento de recursos (*bulkheading*). Rotas pesadas/lote não podem compartilhar o mesmo pool de conexões de transações unitárias de alta prioridade. É mandatória a implementação de *rate-limiting* dedicado para chamadas em lote antes de qualquer tentativa de re-deploy.
+
+---
+
+**Confiança:** Alto.
+*O que invalidaria esta decisão:* Se o esgotamento de conexões do RDS [Cluster E] e os timeouts de query [log L2] não forem derivados do fluxo volumétrico da nova rota de lote, mas sim de um travamento (lock) persistente ou atividade maliciosa externa que persista independentemente da versão do código em execução.

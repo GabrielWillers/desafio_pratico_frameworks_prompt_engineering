@@ -1,0 +1,174 @@
+# Runbook: [CRITICAL] High memory usage on Chronos API pods (>85% for 10min)
+
+## 1. Cabeçalho
+
+* **Alerta:** `[CRITICAL] High memory usage on Chronos API pods (>85% for 10min)`
+* **Severidade:** Crítica (P1)
+* **Resumo:** O consumo de memória RAM dos pods do serviço Chronos API ultrapassou 85% de sua capacidade máxima estipulada por um período contínuo de 10 minutos. Há risco iminente de indisponibilidade geral devido a reinícios automáticos por falta de memória (*Out Of Memory Killed - OOMKilled*).
+* **Pré-requisitos:**
+* Acesso autenticado via CLI ao cluster EKS de produção.
+* Ferramentas instaladas localmente: `kubectl`, `aws cli`, `argocd cli`.
+* Permissão de escrita no namespace `production`.
+
+
+
+---
+
+## 2. Diagnóstico Inicial
+
+Siga os passos sequenciais abaixo para identificar a causa raiz do alerta. Não pule etapas.
+
+### Passo 1: Identificar os pods afetados e o status de reinício
+
+* **Objetivo:** Listar a utilização em tempo real de memória de todos os pods do serviço e verificar se já ocorrem quedas por falta de memória.
+* **Comandos a executar:**
+
+```bash
+# 1. Verifica o consumo de recursos atual dos pods
+kubectl top pod -n production -l app=chronos-api
+
+# 2. Verifica o status atual e contagem de restarts dos pods
+kubectl get pods -n production -l app=chronos-api
+
+```
+
+* **Verificação esperada:** Identifique na coluna `MEMORY(bytes)` quais pods específicos estão acima do limite aceitável e observe a coluna `RESTARTS`.
+* **Critério de decisão:**
+* Se a coluna `STATUS` exibir `CrashLoopBackOff` ou se o comando `kubectl describe pod <POD_NAME> -n production | grep -i "OOMKilled"` retornar positivo, pule imediatamente para a **Mitigação: Opção 2 (Reinício Controlado)**.
+* Se os pods estiverem com status `Running`, mas com uso de memória superior a 85% e sem restarts, prossiga para o Passo 2.
+
+
+
+### Passo 2: Validar o comportamento do HPA (Horizontal Pod Autoscaler)
+
+* **Objetivo:** Verificar se o HPA está travado ou incapaz de criar novas réplicas para diluir a carga.
+* **Comando a executar:**
+
+```bash
+kubectl get hpa chronos-api -n production
+
+```
+
+* **Verificação esperada:** Analise o output nas colunas `REFERENCE`, `TARGETS`, `MINPODS`, `MAXPODS` e `REPLICAS`. O comportamento padrão do HPA para este serviço monitora **CPU (target 70%)**, o que significa que se a memória subir isoladamente, o HPA não escalará o ambiente por padrão.
+* **Critério de decisão:**
+* Se o número de `REPLICAS` for menor que 12 (máximo) e o consumo de CPU estiver baixo (impedindo o HPA de escalar), vá para a **Mitigação: Opção 1 (Escalonamento Manual do HPA)**.
+* Se o número de `REPLICAS` já for 12, prossiga para o Passo 3.
+
+
+
+### Passo 3: Investigar gargalos em dependências nos logs (Ledger e Reactor)
+
+* **Objetivo:** Isolar se o consumo de memória está atrelado a falhas de comunicação com o banco de dados (Ledger) ou com as filas SQS (Reactor).
+* **Comando a executar:**
+
+```bash
+kubectl logs --tail=200 -n production -l app=chronos-api | grep -Ei "error|exception|timeout|ledger|reactor"
+
+```
+
+* **Verificação esperada:** Verifique se há ocorrências em massa de logs contendo `Connection timeout` para o banco Ledger ou `Failed to delete message` / `Queue full` para as filas do Reactor.
+* **Critério de decisão:**
+* Se encontrar erros massivos e repetitivos direcionados ao banco Ledger ou Reactor, acione os donos destas infraestruturas no Slack imediatamente e prossiga para a **Mitigação: Opção 2** para tentar dar fôlego ao serviço.
+* Se não houver erros de dependências e a memória crescer linearmente sem tráfego anormal, caracteriza-se um *Memory Leak* da aplicação. Siga para a **Mitigação: Opção 3 (Reversão)** se um deploy recente tiver ocorrido nas últimas 2 horas.
+
+
+
+---
+
+## 3. Mitigação
+
+Aplique as opções abaixo por ordem de prioridade e de acordo com o diagnóstico técnico coletado na seção anterior.
+
+### Opção 1: Escalonamento Manual via HPA (Menos invasiva)
+
+* **Quando aplicar:** Quando o número de réplicas atual for menor que 12 e o HPA não disparar a escala sozinho devido ao baixo consumo de CPU.
+* **Comando a executar:**
+
+```bash
+# Altera temporariamente a quantidade mínima de réplicas no HPA para forçar a criação de pods
+kubectl patch hpa chronos-api -n production -p '{"spec":{"minReplicas":12}}'
+
+```
+
+* **Efeito esperado:** Criação imediata de novas réplicas até atingir o limite de 12 instâncias, dividindo as conexões de rede e aliviando a memória global.
+* **Verificação:** Execute `kubectl get pods -n production -l app=chronos-api -w` e valide se os novos pods atingem o estado `1/1 Running`.
+
+### Opção 2: Reinício Controlado do Deployment (Média invasividade)
+
+* **Quando aplicar:** Quando houver pods em `CrashLoopBackOff`, com evento explícito de `OOMKilled`, ou quando o escalonamento manual não reduzir a curva de memória dos pods antigos.
+* **Comando a executar:**
+
+```bash
+kubectl rollout restart deployment chronos-api -n production
+
+```
+
+* **Efeito esperado:** Substituição gradual e segura (*Rolling Update*) de todos os pods antigos por novas instâncias com memória zerada, sem causar *downtime* no tráfego.
+* **Verificação:** Acompanhe o andamento do processo usando o comando abaixo até que ele retorne sucesso:
+
+```bash
+kubectl rollout status deployment chronos-api -n production
+
+```
+
+### Opção 3: Reversão de Versão via Argo CD (Mais invasiva)
+
+* **Quando aplicar:** Se as opções 1 e 2 falharem e for constatado que houve um deploy do repositório `hvt/chronos-api` nas últimas horas que iniciou o vazamento de memória.
+* **Comandos a executar:**
+
+```bash
+# 1. Identifique o ID da revisão anterior que estava estável
+argocd app history chronos-api --app-namespace production
+
+# 2. Execute o rollback para o ID identificado (substitua <REVISION_ID>)
+argocd app rollback chronos-api <REVISION_ID> --app-namespace production
+
+```
+
+* **Efeito esperado:** O Argo CD reverterá os manifestos do Kubernetes para a imagem Docker estável anterior e reiniciará os pods na versão antiga.
+* **Verificação:** Verifique se o status do aplicativo no Argo CD mudou para `Synced` executando: `argocd app get chronos-api --app-namespace production`.
+
+---
+
+## 4. Critérios de Escalação
+
+Acione o time de engenharia sênior marcando **`@chronos-core`** no canal **`#oncall-chronos`** do Slack imediatamente se qualquer um dos seguintes cenários for validado:
+
+* **Cenário A:** Após aplicar a Opção 1 (Escalonamento) e a Opção 2 (Rollout Restart), os novos pods continuarem atingindo >85% de memória em menos de 5 minutos após ficarem operacionais.
+* **Cenário B:** Mais de 50% das réplicas (6 de 12) estiverem presas simultaneamente com status `CrashLoopBackOff` ou `OOMKilled`.
+* **Cenário C:** O tempo decorrido desde o disparo do alerta atingiu 15 minutos e nenhuma das ações mitigatórias surtiu efeito na redução da métrica.
+
+> **Template de Mensagem para Escalação:**
+> 🚨 **Escalação de Incidente - Chronos API**
+> * **Alerta Ativo:** High memory usage on Chronos API pods
+> * **Status Atual:** Aplicados passos de mitigação [listar as opções aplicadas, ex: Opção 1 e 2], mas sem sucesso. Os pods continuam sofrendo OOMKilled.
+> * **Outputs de Diagnóstico:** Uso de memória atual em X%, réplicas em Y/12. Erros identificados nos logs: [inserir trecho curto de erro se houver].
+> * **Apoio Necessário:** Investigação de código / autorização para alteração de limites de recursos no repositório.
+> 
+> 
+
+---
+
+## 5. Critérios de Encerramento
+
+O incidente será considerado encerrado e resolvido apenas quando atender cumulativamente aos três critérios objetivos abaixo:
+
+1. **Estabilidade de Métricas:** Todos os pods ativos da `chronos-api` devem apresentar consumo estável de memória **abaixo de 75%** por pelo menos 15 minutos consecutivos.
+2. **Disponibilidade de Instâncias:** O número de réplicas prontas em execução deve estar em conformidade com o desejado pelo deployment (mínimo de 4 pods em estado `1/1 Running` e sem novos reinícios registrados nas últimas duas horas).
+3. **Normalização de Tráfego:** A taxa de erros HTTP 5xx originada na API Chronos e visualizada no dashboard do Grafana deve ser inferior a 1%.
+
+---
+
+## 6. Pós-Incidente Obrigatório
+
+Após a estabilização completa do serviço, o plantonista deve impreterivelmente realizar os seguintes passos de registro:
+
+1. **Restaurar HPA (Se modificado):** Caso tenha alterado o `minReplicas` na Opção 1, retorne o valor padrão para o HPA para evitar custos desnecessários de infraestrutura rodando o comando:
+
+```bash
+kubectl patch hpa chronos-api -n production -p '{"spec":{"minReplicas":4}}'
+
+```
+
+2. **Notificar o canal:** Escreva uma mensagem curta de encerramento no canal `#oncall-chronos` ligando o alerta à ação efetuada (ex: *"Incidente mitigado via Rollout Restart após identificação de pico de memória de pods isolados. Métricas normalizadas há 15min."*).
+3. **Abrir Ticket de Postmortem:** Se o alerta exigiu mitigação por rollback (Opção 3) ou escalação para o time sênior, abra um ticket no board com a etiqueta `postmortem-chronos` detalhando os horários de início, mitigação e os comandos executados para análise de causa raiz pelo time de desenvolvimento na próxima sprint.</POD_NAME>

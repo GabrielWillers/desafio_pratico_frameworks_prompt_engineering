@@ -1,0 +1,19 @@
+Justificativa — Gemini 3 vs Sonnet 4.6
+Os dois scripts atendem ao R-T-F: ambos têm set -euo pipefail, trap, função log, check_prereqs, run_dump, upload_s3, cleanup_local, cleanup_s3, e respeitam o pipe pg_dump | gzip sem .sql intermediário. A diferença está no nível de robustez operacional.
+Onde o Gemini 3 saiu melhor
+
+Trap mais informativo: captura LINENO e BASH_COMMAND, então o log diz exatamente qual comando falhou e em que linha. O Sonnet só registra a etapa (CURRENT_STEP), o que é útil mas menos preciso para debug.
+cleanup_s3 mais eficiente: faz o filtro de LastModified direto no JMESPath de uma única chamada list-objects-v2. O Sonnet lista as keys e depois faz um head-object por objeto — N+1 chamadas à API S3, custa mais e demora mais. Em retenção de 30 dias com 1 dump/dia isso é ~30 requisições extras desnecessárias por execução.
+Verifica -w no diretório além de -d, pegando o caso de permissão errada que o Sonnet deixa passar.
+
+Onde o Sonnet 4.6 saiu melhor
+
+pg_dump --lock-wait-timeout=30s: detalhe pequeno mas que evita um backup pendurar indefinidamente em produção esperando lock — é exatamente o tipo de armadilha que justifica a persona de SRE no Role.
+aws s3 cp --sse AES256 --storage-class STANDARD_IA: SSE é higiene mínima para backup de banco; STANDARD_IA reduz custo num caso de uso (acesso raro) onde isso casa perfeitamente.
+check_prereqs acumula falhas antes de abortar: o operador vê todos os pré-requisitos faltantes de uma vez em vez de descobrir um por execução.
+log com tee -a: aparece em stdout também, o que ajuda quando se roda manualmente para testar. O Gemini só escreve no arquivo.
+Inclui a linha de crontab no final, que o prompt pedia explicitamente. O Gemini esqueceu.
+Função main() explícita e prefixo S3 (backups/) — organização melhor para um bucket que vai acumular objetos por anos.
+
+Veredito
+Empate técnico com vantagens em eixos diferentes: Gemini 3 é mais cuidadoso na engenharia do script em si (trap, eficiência de API, validação de permissão); Sonnet 4.6 é mais cuidadoso no contexto de produção (timeout de lock, criptografia, storage class, crontab pedido no prompt). Para merge direto em produção, o Sonnet 4.6 está mais perto do pronto — atende todos os itens explícitos do prompt, incluindo a crontab. Para um script "exemplar" de referência, o Gemini 3 tem o trap mais didático e o cleanup_s3 mais bem escrito. O ideal seria o Sonnet 4.6 com o trap e o cleanup_s3 do Gemini 3.

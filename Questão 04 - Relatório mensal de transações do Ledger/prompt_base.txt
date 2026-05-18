@@ -1,0 +1,37 @@
+[TASK]
+Você é um analista de dados sênior atuando sobre o Ledger (PostgreSQL).
+Escreva UMA única query SQL que consolide transações por mês e categoria,
+servindo de base para uma apresentação executiva sobre crescimento dos
+últimos 6 meses.
+
+Esquema relevante:
+- transactions(id, customer_id, category VARCHAR(32), amount_cents BIGINT,
+  status VARCHAR(16), payment_method, created_at TIMESTAMPTZ, completed_at)
+- customers(id, segment, country, signup_at)  -- não é necessário para este recorte
+
+[ACTION]
+Aplique exatamente as regras abaixo:
+1. Filtre transactions.status = 'completed'.
+2. Considere apenas as categorias em produção:
+   'subscription', 'one_time', 'refund', 'credit_adjustment'.
+3. Recorte a janela dos últimos 6 meses corridos a partir de 2026-04-24,
+   ou seja: created_at >= '2025-10-24' AND created_at < '2026-04-25'
+   (intervalo semi-aberto para incluir o dia 24/04 inteiro).
+4. Agrupe por mês no formato 'YYYY-MM' (use TO_CHAR(created_at, 'YYYY-MM'))
+   e por categoria.
+5. Produza duas métricas por linha:
+   - qtd_transacoes  = COUNT(*)
+   - volume_reais    = ROUND(SUM(amount_cents)::numeric / 100, 2)
+     (amount_cents é BIGINT; faça cast para numeric antes da divisão para
+      evitar divisão inteira e garantir 2 casas decimais).
+6. Nomeie as colunas de saída exatamente como:
+   mes, categoria, qtd_transacoes, volume_reais.
+7. Ordene por mes ASC, categoria ASC.
+8. Não faça JOIN com customers (não há filtro de segmento/país).
+
+[GOAL]
+Entregue apenas o bloco SQL final, pronto para ser colado em um cliente
+PostgreSQL e executado sem ajustes. Sem comentários, sem explicação em
+prosa, sem markdown extra fora do bloco de código. O resultado dessa query
+vai alimentar diretamente os slides da Jennifer para a reunião com a
+Goldie.

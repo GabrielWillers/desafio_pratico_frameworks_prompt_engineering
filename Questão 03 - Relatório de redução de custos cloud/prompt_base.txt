@@ -1,0 +1,56 @@
+[TAREFA]
+Atue como especialista em FinOps cloud sênior. Analise o breakdown de 
+custos AWS abaixo (CSV) e produza um relatório executivo de 
+oportunidades de redução de custo, priorizadas por impacto financeiro.
+
+CSV:
+servico,categoria,custo_mensal_usd,uso_medio_pct,observacao
+EC2 reservada,compute,4200,72,contrato de 1 ano
+EC2 on-demand,compute,8200,45,workloads variaveis
+EKS,compute,6700,58,3 clusters
+RDS PostgreSQL,databases,8200,62,multi-AZ
+ElastiCache Redis,databases,2100,40,cluster de producao
+S3 Standard,storage,3100,,5 buckets principais
+EBS gp3,storage,1600,68,volumes de producao
+CloudWatch Logs,observability,2800,,retencao de 90 dias
+CloudWatch Metrics,observability,900,,
+Data Transfer Out,network,1900,,trafego entre regioes
+NAT Gateway,network,1200,,3 gateways ativos
+Lambda,compute,900,30,~12M invocacoes/mes
+
+[AÇÃO]
+1. Calcule o custo mensal total da conta e o valor absoluto que 
+   representa a meta de 15% de redução.
+2. Para cada linha do CSV, cruze custo_mensal_usd × uso_medio_pct × 
+   observacao para detectar desperdício, sub-utilização ou padrão de 
+   contratação ineficiente.
+3. Gere uma tabela markdown ordenada por economia estimada 
+   (maior → menor) com as colunas:
+   - Serviço
+   - Ação recomendada (concreta, não genérica)
+   - Economia estimada (USD/mês e % da conta total)
+   - Esforço de implementação (Baixo/Médio/Alto)
+   - Riscos e pré-requisitos
+4. Use faixas realistas de economia baseadas em práticas conhecidas 
+   (ex.: Savings Plans 20–40%, S3 Intelligent-Tiering 30–50%, 
+   retenção de logs 40–60%). Justifique brevemente cada estimativa.
+5. Some o potencial total e indique quais iniciativas, combinadas, 
+   atingem ≥15% sem depender de ações de Alto esforço/risco.
+6. Finalize com um resumo executivo de até 5 linhas para a Goldie: 
+   custo total, meta em USD, top 3 alavancas, total atingível no 
+   trimestre, principal risco para o SLA.
+
+Restrições:
+- Português, tom executivo, sem jargão desnecessário.
+- Não recomende ações que comprometam Multi-AZ do RDS nem retirem 
+   redundância de produção.
+- Se houver dado faltante no CSV (uso_medio_pct vazio), declare 
+   explicitamente a premissa adotada.
+
+[META]
+Entregar à Goldie um plano acionável que permita à diretoria aprovar, 
+no próximo trimestre, iniciativas suficientes para reduzir 15% do 
+custo cloud sem degradar SLA, decidindo com base em ROI vs. 
+esforço/risco.
+
+Gere um arquivo em .md
